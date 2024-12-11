@@ -9,11 +9,7 @@ library(dplyr)
 library(lubridate)
 library(ggplot2)
 # Load the JSON file
-# Load the JSON file
 data <- fromJSON('C:/Users/sefarrell/Downloads/Actigraphy Final to Post/Actigraphy/Final to Post/BOGN00001/minbymin/min_2018-04-01-2019-08-30.json')
-
-# Convert to a dataframe
-df <- as.data.frame(data$items)  # Assuming 'items' is the key for records
 
 # Clean df to remove excess activeness values
 df <- df[df$activeness != 20, ]
