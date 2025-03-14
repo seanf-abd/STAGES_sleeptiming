@@ -1,41 +1,158 @@
-library(dplyr)
+# Load necessary libraries
 library(jsonlite)
+library(dplyr)
+library(lubridate)
+library(readxl)  # For reading Excel files
 
-# Load the JSON data (replace with your file path)
-data <- fromJSON('C:/Users/sefarrell/Downloads/Actigraphy Final to Post/Actigraphy/Final to Post/BOGN00001/minbymin/min_2018-04-01-2019-08-30.json')
+# Define paths
+actigraphy_folder <- "C:/Users/sefarrell/Downloads/STAGES_PSG/BOGN Actigraphy/"
+psg_date_file <- "C:/Users/sefarrell/Downloads/STAGES_PSG/PSG_date/STAGES PSG DATES.xlsx"  # Correct path to your PSG dates file
 
-# Convert JSON to dataframe
-df <- as.data.frame(data$items)
-
-# Example date for testing
-date_example <- "2018-10-03"
-
-# Filter data for one specific day
-single_day <- df %>% filter(date == date_example)
-
-# Define inactivity periods (activeness <= 2 is considered inactive)
-single_day <- single_day %>%
-  mutate(sleep_inactive = ifelse(activeness <= 2, 1, 0))
-
-# Track consecutive inactivity periods
-single_day <- single_day %>%
-  mutate(consecutive_inactive = ifelse(sleep_inactive == 1, 
-                                       cumsum(sleep_inactive), 
-                                       0))
-
-# Detect sleep onset: first 5+ consecutive minutes of inactivity
-onset_index <- which(single_day$consecutive_inactive >= 5)[1]
-
-if (!is.na(onset_index)) {
-  sleep_onset_minute <- single_day$minute[onset_index]
+# Function to process actigraphy data from a single JSON file for each subject
+process_actigraphy <- function(subject_id) {
   
-  # Convert minute to HH:MM format
-  sleep_onset_time <- sprintf("%02d:%02d", sleep_onset_minute %/% 60, sleep_onset_minute %% 60)
+  # Construct the path to the subject's minbymin folder
+  subject_folder <- file.path(actigraphy_folder, subject_id, "minbymin")
   
-  print(paste("Sleep onset for", date_example, "is at", sleep_onset_time))
-} else {
-  print(paste("No sleep onset detected for", date_example))
+  # List the JSON file in the minbymin folder for the subject
+  actigraphy_file <- list.files(subject_folder, pattern = "\\.json$", full.names = TRUE)
+  
+  # Check if any JSON files are found for the subject
+  if (length(actigraphy_file) == 0) {
+    message("No actigraphy file found for subject: ", subject_id)
+    return(NULL)
+  }
+  
+  # Print the file being processed for debugging
+  message("Processing actigraphy file: ", actigraphy_file)
+  
+  # Read the raw content of the JSON file to inspect it
+  raw_content <- readLines(actigraphy_file)
+  
+  # Find the line where the JSON data starts (first occurrence of "date":)
+  start_line <- grep('"date":"', raw_content)
+  
+  if (length(start_line) == 0) {
+    message("Error: No valid JSON data found in file: ", actigraphy_file)
+    return(NULL)
+  }
+  
+  # Extract the valid JSON content from the file
+  valid_json <- paste(raw_content[start_line:length(raw_content)], collapse = "\n")
+  
+  # Parse the valid JSON content
+  actigraphy_data <- fromJSON(valid_json)
+  
+  # Extract the 'items' field that contains the actigraphy data
+  items <- actigraphy_data$items
+  
+  # Check if there is any actigraphy data available
+  if (length(items) == 0) {
+    message("No actigraphy data found for subject: ", subject_id)
+    return(NULL)
+  }
+  
+  # Convert the 'date' field to Date format (ignoring time)
+  items_df <- as.data.frame(items)
+  
+  # Get the start and end dates of the actigraphy data
+  actigraphy_start <- min(as.Date(items_df$date))
+  actigraphy_end <- max(as.Date(items_df$date))
+  
+  # Return a data frame with the subject ID and actigraphy start and end dates
+  return(data.frame(Subject_ID = subject_id, 
+                    Actigraphy_Start_Date = actigraphy_start,
+                    Actigraphy_End_Date = actigraphy_end))
 }
 
-# View the result for consecutive inactivity tracking
-head(single_day[, c("minute", "activeness", "sleep_inactive", "consecutive_inactive")])
+# Function to get PSG start date for a given subject from the Excel file
+get_psg_date <- function(subject_id) {
+  # Read the PSG date Excel file
+  psg_date_data <- read_excel(psg_date_file)
+  
+  # Clean column names to avoid any issues with extra spaces
+  colnames(psg_date_data) <- trimws(colnames(psg_date_data))  # Remove any extra spaces
+  
+  # Print the first few rows to debug and verify the columns
+  print(head(psg_date_data))  # DEBUG
+  
+  # Filter the data for the specific subject_id
+  psg_date_row <- psg_date_data %>%
+    filter(subject_id == subject_id)  # This should correctly filter for the subject_id
+  
+  # Print the filtered row for debugging purposes
+  print(psg_date_row)  # DEBUG
+  
+  # If no row is found, return NA
+  if (nrow(psg_date_row) == 0) {
+    return(NA)
+  }
+  
+  # Extract the PSG start date
+  psg_date_value <- psg_date_row$modified.date_of_evaluation[1]
+  
+  # Convert to Date if necessary (if it's in Excel serial date format)
+  if (is.character(psg_date_value)) {
+    psg_date_value <- as.numeric(psg_date_value)
+  }
+  
+  if (is.numeric(psg_date_value)) {
+    psg_date_value <- as.Date(psg_date_value, origin = "1899-12-30")
+  }
+  
+  # Return the PSG date (if it's a valid Date)
+  if (inherits(psg_date_value, "Date")) {
+    return(format(psg_date_value, "%Y-%m-%d"))
+  } else {
+    return(NA)
+  }
+}
+
+# Function to get subject IDs from the actigraphy folder
+get_subject_ids <- function(actigraphy_folder) {
+  # List the folders in the BOGN Actigraphy directory (which represent subject IDs)
+  subject_ids <- list.dirs(actigraphy_folder, full.names = FALSE, recursive = FALSE)
+  subject_ids <- basename(subject_ids)  # Extract folder names (i.e., subject IDs)
+  return(subject_ids)
+}
+
+# Get the list of subject IDs
+subject_ids <- get_subject_ids(actigraphy_folder)
+
+# Print subject IDs to debug
+print(subject_ids)  # DEBUG
+
+# Process actigraphy data for each subject
+actigraphy_results <- lapply(subject_ids, process_actigraphy)
+
+# Filter out NULL results (subjects with no valid data)
+actigraphy_results <- actigraphy_results[!sapply(actigraphy_results, is.null)]
+
+# Combine the results into a data frame for actigraphy
+actigraphy_summary <- do.call(rbind, actigraphy_results)
+
+# Get PSG dates for each subject (ensure proper iteration for each subject)
+psg_dates <- sapply(subject_ids, function(subject_id) {
+  get_psg_date(subject_id)
+})
+
+# Now we need to align the actigraphy data with the PSG data
+# We'll create a data frame for actigraphy and another for PSG dates
+actigraphy_data_final <- actigraphy_summary %>%
+  filter(Subject_ID %in% subject_ids)  # Filter only subjects that have actigraphy data
+
+# PSG dates data frame
+psg_data_final <- data.frame(Subject_ID = subject_ids,
+                             PSG_Start_Date = psg_dates)
+
+# Merge the actigraphy and PSG data based on Subject_ID
+final_summary <- merge(actigraphy_data_final, psg_data_final, by = "Subject_ID", all = TRUE)
+
+# Print the final summary to debug
+print(head(final_summary))  # DEBUG
+
+# Output the final data to a CSV file
+write.csv(final_summary, "C:/Users/sefarrell/Downloads/final_summary.csv", row.names = FALSE)
+
+# Print a message to indicate the file has been saved
+message("Final summary saved to 'C:/Users/sefarrell/Downloads/final_summary.csv'")

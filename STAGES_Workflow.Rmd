@@ -1,0 +1,739 @@
+---
+title: "STAGES workflow"
+author: "Seán F"
+date: "`r Sys.Date()`"
+output: html_document
+---
+#Load libraries
+```{r libs, include=FALSE}
+library(lubridate)
+library(jsonlite)
+library(readxl)
+library(readr)
+library(ggplot2)
+library(data.table)
+library(stringr)
+library(knitr)
+library(gridExtra)
+library(writexl)
+library(tidyr)
+library(dplyr)
+library(kableExtra)
+```
+#Inital screening
+```{r Initial screening for subjects}
+#Initial screening, load excel file with all questionnaires and demographics as df
+screener <- "C:/Users/sefarrell/Downloads/STAGES things/Questionnaires/All participant demographics.csv"
+df <- read.csv(screener)
+
+#Define exclusion criteria
+excluded_crit <- df %>% filter(
+  sched_0510 == 1 |
+  mdhx_6200 == 1 |
+  cir_0100 == 1 |
+  narc_0050 == 1 |
+  mdhx_0400 %in% c(0,1,55)
+  )
+#Filter through df so only included subjects are kept 
+included_subjects <- df %>% filter (!subject_code %in% excluded_crit$subject_code)
+
+#Save initial screen as csv to make future analysis easier 
+write.csv(included_subjects,"C:/Users/sefarrell/Downloads/Eligible_Subjects_without_PSG.csv", row.names = FALSE)
+
+#Refine exclusion criteria to ensure included subjects have a corresponding PSG
+psg_file <- "C:/Users/sefarrell/Downloads/STAGES things/Questionnaires/STAGES_PSG_list.xlsx" 
+eligible_subjects_file <- "C:/Users/sefarrell/Downloads/Eligible_Subjects_without_PSG.csv"
+eligible_subjects <- read_csv(eligible_subjects_file) %>%
+  select(subject_code)
+
+#Load PSG data list
+psg_data <- read_excel(psg_file) %>%
+  rename(File_Name = Subject_Code)
+ #Remove trailing spaces from file name (there are loads after the .edf endnig for some reason)
+psg_data <- psg_data %>%
+  mutate(File_Name = str_squish(File_Name))
+#Subject_ID properly defined as some PSG entries are segmented 
+psg_data <- psg_data %>%
+  mutate(Subject_ID = gsub("_.*|\\.edf$|\\.csv$", "", File_Name))
+
+#Ensure that subject has .edf and .csv file 
+psg_summary <- psg_data %>%
+  group_by(Subject_ID) %>%
+  summarise(has_EDF = any(str_detect(File_Name, "\\.edf$")),
+  has_CSV = any(str_detect(File_Name, "\\.csv$"))
+  ) %>%
+  mutate(PSG_Complete = has_CSV & has_EDF)  #TRUE if both are present
+#merge with eligible subjects, ensuring column names match
+merged_data <- eligible_subjects %>%
+  rename(Subject_ID = subject_code) %>%   #Rename to match psg_summary
+  left_join(psg_summary, by = "Subject_ID")
+
+#Mark subjects with missing PSG data
+merged_data <- merged_data %>%
+  mutate(PSG_Status = case_when(
+   is.na(has_EDF) & is.na(has_CSV) ~ "Missing Both",
+    has_EDF == FALSE ~ "Missing EDF",
+    has_CSV == FALSE ~ "Missing CSV",
+    PSG_Complete == TRUE ~ "Complete",
+    TRUE ~ "Unknown",  #Just to identify any unexpected cases
+  ))
+#Count results
+num_complete <- sum(merged_data$PSG_Status == "Complete", na.rm = TRUE)
+num_missing <- sum(merged_data$PSG_Status != "Complete", na.rm = TRUE)
+
+#Create the summary statements
+initial_screen <- paste(nrow(included_subjects), "meet the initial inclusion criteria for this dataset.\n")
+psg_screen <- paste(num_complete, "eligible subjects have complete PSG data.\n")
+psg_missing <- paste(num_missing, "eligible subjects are missing PSG files.\n")
+summary_report <- paste("===== Summary of Screening=====\n",initial_screen, psg_screen, psg_missing, sep = "\n")
+#Write the combined summary report to a text file
+writeLines(summary_report, "C:/Users/sefarrell/Downloads/Summary_report_screening.txt")
+#Optionally, write the merged data to a CSV file
+write.csv(merged_data, "C:/Users/sefarrell/Downloads/Summary_report_screening.csv", row.names = FALSE)
+```
+#Load all data and choose selected subjects 
+```{r Data load, echo=FALSE}
+#Load eligible subjects from file
+eligible_subjects_file <- "C:/Users/sefarrell/Downloads/Eligible_Subjects_PSG_Check.csv"
+eligible_subjects <- read_csv(eligible_subjects_file) %>%
+  filter(psg_status == "Complete") %>%  #Keep only subjects with complete PSG data
+  select(Core_Subject_ID) %>%  #Keep subject IDs
+  pull()
+
+#Load actigraphy data from source folder, use batches for the sake of my laptop 
+actigraphy_folder <- 'C:/Users/sefarrell/Downloads/Actigraphy Final to Post/Actigraphy/Final to Post/'
+good_data <- list() #List for downstream processing
+bad_files <- list(
+  "Empty files" = character(),
+  "Invalid Structure" = character(),
+  "Parsing Failed" = character()
+) #This will hold subjects with missing/unreadable data 
+batch_size <- 80 #Can change batch size if running too slow/fast but this works well for mise 
+
+#ATM the data folders for each subject are stored as a list of all dirs in actigraphy folder, use recursive to list immediate subdirs in folder.
+subject_folders <- list.dirs(actigraphy_folder, recursive = FALSE, full.names = TRUE)
+subject_ids <- basename(subject_folders)
+subject_folders <- subject_folders[subject_ids %in% eligible_subjects]
+
+#Folders split into batches from seq of numbers from 1 to batch size. 
+subject_batches <- split(subject_folders, ceiling(seq_along(subject_folders) / batch_size))
+
+#Load .json file
+load_json_file <- function(file_path) {
+  #Read the file content
+  json_text <- tryCatch({
+    readLines(file_path, warn = FALSE) #reads line by line and prevents errors from being printed if there is an incomplete line
+  }, error = function(e) {
+    warning(paste("Failed to read file:", file_path, "Error:", e$message))
+    return(NA)
+  })
+  
+  #If the file is empty or couldn't be read, add it to bad_files and return NA
+  if (length(json_text) == 0 || all(is.na(json_text))) {
+    warning(paste("Empty file or read error:", file_path))
+    bad_files[["Empty files"]] <<- c(bad_files[["Empty files"]], file_path)
+    return(NA)
+  }
+  
+  #Skip to line that contains '{', the data starts here. Some of the .json's have a header some don't
+  json_start <- grep("\\{", json_text)[1]  
+  
+  #JSON's should be in a nested structure so if they are missing '{' the structure is bad
+  if (is.na(json_start)) {
+    warning(paste("Invalid structure:", file_path))
+    bad_files[["Invalid Structure"]] <<- c(bad_files[["Invalid Structure"]], file_path)
+    return(NA)
+  }
+  
+  #Get rid of the ugly stuff and keep the data 
+  clean_json <- paste(json_text[json_start:length(json_text)], collapse = "\n")
+  
+  #Convert to df, subjects go to bad files if they can't be loaded into df
+  tryCatch({
+    df <- fromJSON(clean_json, flatten = TRUE)
+    
+    #If 'items' exists but is an empty list, mark as bad file and return NA
+    if ("items" %in% names(df) && length(df$items) == 0) {
+      warning(paste("Empty 'items' JSON file:", file_path))
+      bad_files[["Empty files"]] <<- c(bad_files[["Empty files"]], file_path)
+      return(NA)  #Ignore this file
+    }
+    
+    #Extract data from "items"
+    if ("items" %in% names(df)) {
+      df <- df$items
+    }
+
+    #Ensure 'date' column is in appropriate date format, STAGES data in Y-D-M format which I don't like
+    df$date <- as.Date(df$date, format = "%Y-%m-%d")  
+    
+    #Convert to POSIXct timestamp using 'minute' column, time values computed as mins from 0-1439 in dataset
+    df$timestamp <- as.POSIXct(df$date, format = "%Y-%m-%d", tz = "UTC") + df$minute * 60  
+    
+    return(df)
+  }, error = function(e) {
+    warning(paste('Failed to load .json: ', file_path, "Error:", e$message))
+    bad_files[["Parsing Failed"]] <<- c(bad_files[["Parsing Failed"]], file_path)
+    return(NA)  #Mark as bad file
+  })
+}
+for (batch_num in seq_along(subject_batches)) {
+  cat("\nProcessing Batch", batch_num, "of", length(subject_batches), "...\n")
+  batch <- subject_batches[[batch_num]] #selects current batch_num
+  #Initialize temporary emtpy list to store batch data
+  batch_data <- list()
+  for (subject in batch) {
+    minbyminpath <- file.path(subject, "minbymin")
+    #If there's a valid min by min folder in subject folder then proceed with analysis
+    if (dir.exists(minbyminpath)) {
+      json_files <- list.files(path = minbyminpath, pattern = "*.json", full.names = TRUE)
+      #Read each JSON file and store in a list
+      subject_data <- lapply(json_files, function(file) { #use lapply in case of multiple .jsons
+        result <- load_json_file(file) #load json from prev function 
+        if (is.null(result) || all(is.na(result))) { #if all values missing OR all values NA 
+          cat("Skipped problematic file:", file, "\n")
+          return(NULL)  #Return NULL to skip this file
+        }
+        return(result)
+      })
+      #Remove NULL entries from subject data, these are the problem files 
+      subject_data <- Filter(Negate(is.null), subject_data) #in case .json wasn't read and null was returned
+      #Only save it there is actual output from subject 
+      if (length(subject_data) > 0) {
+        batch_data[[basename(subject)]] <- subject_data
+      } else {
+        cat("No valid data for subject:", basename(subject), "\n")
+      }
+    }
+  }
+  #Store good data in the main list
+  good_data <- c(good_data, batch_data)
+  #Clear temporary batch data and run garbage collection to free up memory
+  rm(batch_data)
+  gc()
+  cat("Finished Batch", batch_num, "\n")
+}
+
+#Summary of processing
+cat("\nAll batches processed successfully!\n")
+
+#Generate summary report
+summary_report <- paste("===== Summary of Problematic Files =====\n",
+  "Empty files:", length(bad_files[["Empty files"]]), "\n",
+  "Invalid structure:", length(bad_files[["Invalid Structure"]]), "\n",
+  "Parsing failed:", length(bad_files[["Parsing Failed"]]), "\n",
+  sep = ""
+)
+#Print summary report to console
+cat(summary_report)
+
+#Save summary report to a file
+write.csv(summary_report, "C:/Users/sefarrell/Downloads/Summary_report_screening.csv")
+
+#Save good data and bad files for later analysis
+save(good_data, file = "actigraphy_data.RData")
+```
+#Enusre data in correct format
+```{r Data format check}
+#Insert loaded dataset
+file <- load("actigraphy_data.RData")
+#Check good_data list exists and if so proceed as normal with checks 
+if (!exists("good_data")) {
+  stop("Error: 'good_data' not found")
+}
+
+#Check the number of subjects
+cat("\n Loaded 'good_data' with", length(good_data), "subjects.\n")
+
+#Do quality checks in batches again
+batch_size <- 50
+num_batches <- ceiling((length(good_data)/batch_size))
+
+#Define necesarry columns and expected input types
+required_columns <- c("timestamp", "date", "minute", "activeness")
+expected_types <- c("POSIXct", "Date", "integer", "numeric")
+#Make log for tracking quality control of all subjects
+format_log <-data.frame(Subject_ID = character(),Issue = character(),stringsAsFactors = FALSE)
+
+for (batch_num in 1:num_batches){
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(good_data))
+  batch <- good_data[start_idx:end_idx]
+  
+  #Iterate through all subjects
+  for (subject_id in names(batch)) {
+    df_list <- batch[[subject_id]][[1]]
+    #Check df is valid
+    if (!is.list(df_list) || length(df_list) == 0 || all(sapply(df_list, is.null)))  {
+      format_log <- rbind(format_log, data.frame(Subject_ID = subject_id, Issue = "Issue with subject dfs"))
+      next
+    }
+    #Check necesarry columns are present
+    missing_cols <- setdiff(required_columns, colnames(df_list))
+    if (length(missing_cols) > 0) {
+      format_log <- rbind(format_log, data.frame(Subject_ID = subject_id, Issue = paste("Missing columns:", paste(missing_cols, collapse=", "))))
+      next
+    }
+      issues <- c()
+      
+      if (!inherits(df_list$timestamp, "POSIXct")) {
+      issues <- c(issues, "timestamp not POSIXct")
+    }
+      if (!inherits(df_list$date, "Date")) {
+      issues <- c(issues, "date not Date format")
+    }
+      if (!is.integer(df_list$minute)) {
+      issues <- c(issues, "minute not integer")
+    }
+      if (!is.numeric(df_list$activeness)) {
+      issues <- c(issues, "activeness not numeric")
+    }
+      if (length(issues > 0)){
+      format_log <-rbind(format_log, data.frame(Subject_ID = subject_id, Issue = paste(issues, collapse = ";")))
+    }
+  }
+  #Clean up what is no longer needed to save some memory
+  rm(batch)
+  gc()
+}
+
+#Save issue log to .csv
+write.csv(format_log,"C:/Users/sefarrell/Downloads/Data_Format_log.csv", row.names = FALSE)
+```
+#Valid day identification - checkpoint for actigraphy data.R
+```{r Valid day identification }
+#Load the updated actigraphy data
+load("actigraphy_data.RData")
+
+#Initialize valid day storage
+full_day_1440 <- list()
+all_days_removed <- list()
+batch_size <- 50 
+
+#Function to classify valid days per subject
+classify_full_days <- function(data_list) {
+  days_1440 <- list()
+  days_removed <- list()
+  
+  for (subject_name in names(data_list)) {
+    subject_data <- data_list[[subject_name]]
+    
+    #Ensure the subject's data is a list and contains a valid dataframe
+    if (is.list(subject_data) && length(subject_data) > 0 && is.data.frame(subject_data[[1]])) {
+      df <- subject_data[[1]]  
+      
+      if (all(c("date", "minute") %in% colnames(df))) {
+        day_summary <- aggregate(minute ~ date, data = df, FUN = function(x) length(unique(x)))
+        
+        valid_dates <- day_summary$date[day_summary$minute >= 1440]
+        invalid_dates <- day_summary$date[day_summary$minute < 1440]
+        
+        valid_days <- subset(df, date %in% valid_dates)
+        
+        if (length(valid_dates) > 0) {
+          days_1440[[subject_name]] <- list(valid_days)  
+        }
+        
+        days_removed[[subject_name]] <- length(invalid_dates)
+
+        #Debug: Print counts for each subject
+        cat("Subject:", subject_name, "| Valid days:", length(valid_dates), "| Invalid days:", length(invalid_dates), "\n")
+      }
+    }
+  }
+  
+  return(list(valid_days = days_1440, days_removed = days_removed))
+}
+
+num_files <- length(good_data)
+num_batches <- ceiling(num_files / batch_size)
+
+for (batch_num in 1:num_batches) {
+  cat("\nProcessing batch", batch_num, "of", num_batches, "...\n")
+  
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, num_files)
+  current_batch <- good_data[start_idx:end_idx]
+  
+  batch_results <- classify_full_days(current_batch)
+  
+  full_day_1440 <- c(full_day_1440, batch_results$valid_days)
+  
+  all_days_removed <- c(all_days_removed, batch_results$days_removed)
+  
+  rm(current_batch, batch_results)
+  gc()
+}
+
+good_data <- full_day_1440
+
+save(good_data, file = "actigraphy_data_1440.RData")
+
+cat("\nProcessing complete! Data saved.\n")
+
+#Debug: Print total number of valid subjects
+cat("Total subjects with valid days:", length(full_day_1440), "\n")
+
+#Count valid days per subject
+valid_days_summary <- sapply(names(full_day_1440), function(subject_name) {
+  subject_data <- full_day_1440[[subject_name]][[1]]
+  if (!is.null(subject_data) && nrow(subject_data) > 0) {
+    return(length(unique(subject_data$date)))
+  } else {
+    return(0)
+  }
+})
+
+#Check if valid_days_summary is not empty, was blank lot of time
+cat("Valid days summary:\n")
+print(valid_days_summary)
+
+#Count days fir removal per subject
+days_removed_summary <- sapply(names(all_days_removed), function(subject_name) {
+  if (!is.null(all_days_removed[[subject_name]])) {
+    return(all_days_removed[[subject_name]])
+  } else {
+    return(0)
+  }
+})
+#Convert to data frame so can be output to .csv
+valid_days_df <- data.frame(
+  Subject = names(valid_days_summary),
+  Valid_Days = valid_days_summary,
+  Days_Removed = days_removed_summary[names(valid_days_summary)],
+  stringsAsFactors = FALSE
+)
+
+#Check if data frame is empty before saving
+if (nrow(valid_days_df) > 0) {
+  write.csv(valid_days_df, file = "C:/Users/sefarrell/Downloads/valid_days_summary.csv", row.names = FALSE)
+  cat("Report saved.\n")
+} else {
+  cat("Warning: No valid data found, CSV not saved.\n")
+}
+
+```
+#Identify missing timepoints and impute
+```{r Imputation}
+#Load the dataset, this wouldn't be necesarry if we go with the 1440 option but good to have just in case 
+load("actigraphy_data_1440.RData")
+
+#Function to identify missing timestamps and perform imputation
+impute_missing_data <- function(df) {
+  #Ensure data is sorted by timestamp
+  df <- df[order(df$timestamp), ]
+  inserted_rows <- list()
+  missing_count <- 0
+  df$imputed_flag <- 0  #Mark original data as non-imputed
+  
+  #Identify missing timestamps and insert rows
+  for (i in 2:(nrow(df) - 1)) {
+    prev_timestamp <- df$timestamp[i]
+    next_timestamp <- df$timestamp[i + 1]
+    
+    #Calculate time difference
+    time_diff <- as.numeric(difftime(next_timestamp, prev_timestamp, units = "mins"))
+    
+    #If the time difference is greater than 1 minute, insert missing rows
+    if (time_diff > 1) {
+      missing_timepoints <- seq(from = prev_timestamp + 60, to = next_timestamp - 60, by = 60)
+      
+      for (tp in missing_timepoints) {
+        new_row <- df[i, ]  #Copy current row
+        new_row$timestamp <- tp
+        new_row$activity <- NA  #Assign missing activity data
+        new_row$imputed_flag <- -1  #Mark as imputed
+        inserted_rows <- append(inserted_rows, list(new_row))
+        missing_count <- missing_count + 1
+      }
+    }
+  }
+  
+  #Combine original data with new inserted rows
+  if (length(inserted_rows) > 0) {
+    inserted_rows <- do.call(rbind, inserted_rows)
+    df <- rbind(df, inserted_rows)
+    df <- df[order(df$timestamp), ]  #Reorder by timestamp
+  }
+  
+  #Perform mean imputation for missing activity counts
+  df$time_of_day <- format(df$timestamp, "%H:%M")  #Extract time of day
+  mean_activity_by_time <- aggregate(activity ~ time_of_day, data = df, FUN = function(x) round(mean(x, na.rm = TRUE)))
+  
+  df <- merge(df, mean_activity_by_time, by = "time_of_day", suffixes = c("", "_mean"))
+  df$activity <- ifelse(is.na(df$activity), df$activity_mean, df$activity)
+  df <- df[, !colnames(df) %in% c("time_of_day", "activity_mean")]  #Clean up
+  
+  return(df)
+}
+
+#Define batch size
+batch_size <- 50
+num_batches <- ceiling(length(full_day_1440) / batch_size)
+
+#Initialize list to store imputed data
+full_day_1440_imputed <- list()
+imputation_status <- list()
+
+#Process data in batches
+for (batch_num in 1:num_batches) {
+  cat("\nProcessing batch", batch_num, "of", num_batches, "...\n")
+  
+  #Define batch start and end indices
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(full_day_1440))
+  batch_subjects <- names(full_day_1440)[start_idx:end_idx]
+  
+  #Apply imputation function
+  imputed_batch <- lapply(batch_subjects, function(subject_name) {
+    df <- full_day_1440[[subject_name]]
+    if (is.data.frame(df) && all(c("timestamp", "activity") %in% colnames(df))) {
+      result <- impute_missing_data(df)
+      list(df = result, imputation_needed = TRUE)
+    } else {
+      list(df = df, imputation_needed = FALSE)
+    }
+  })
+  
+  #Store the imputed batch
+  for (i in seq_along(batch_subjects)) {
+    full_day_1440_imputed[[batch_subjects[i]]] <- imputed_batch[[i]]$df
+    imputation_status[[batch_subjects[i]]] <- imputed_batch[[i]]$imputation_needed
+  }
+  
+  #Clean up memory
+  rm(batch_subjects, imputed_batch)
+  gc()
+}
+
+#Save the imputed dataset, overwrite new full 
+save(full_day_1440_imputed, file = "actigraphy_data_1440.RData")
+
+#Count total imputed values per subject
+imputation_summary <- sapply(names(full_day_1440_imputed), function(subject_name) {
+  df <- full_day_1440_imputed[[subject_name]]
+  if (is.data.frame(df) && "imputed_flag" %in% colnames(df)) {
+    sum(df$imputed_flag == -1, na.rm = TRUE)
+  } else {
+    0
+  }
+})
+
+#Ensure imputation status matches the subjects
+imputation_status_summary <- sapply(names(imputation_summary), function(subject_name) {
+  if (!is.null(imputation_status[[subject_name]]) && imputation_status[[subject_name]]) {
+    "Imputation Performed"
+  } else {
+    "No Imputation Needed"
+  }
+})
+
+#Convert summary to a data frame
+imputation_summary_df <- data.frame(
+  Subject = names(imputation_summary),
+  Total_Imputed_Values = imputation_summary,
+  Imputation_Status = imputation_status_summary,
+  stringsAsFactors = FALSE
+)
+
+#Ensure no mismatch in row numbers before saving
+if (nrow(imputation_summary_df) > 0) {
+  write.csv(imputation_summary_df, file = "C:/Users/sefarrell/Downloads/imputation_summary.csv", row.names = FALSE)
+  cat("Imputation complete. Report saved.\n")
+} else {
+  cat("Error: No imputation data found, check input dataset.\n")
+}
+```
+#Local timezone identification and conversion
+```{r Time zone of subject}
+file <- load("actigraphy_data_1440.RData")
+#Map study collection sites to appropriate timezone
+tz_map <- list(
+  UTC_5 = c("GSSB", "BOGN", "GSDV", "GSLH", "GSSA", "GSSW", "MSNF", "MSQW", "MSTR", "MSMI", "MSTH"),
+  UTC_6 = c("MAYO", "STLK"),
+  UTC_8 = c("STNF")
+)
+#Timezone based on first 4 characters of the subject name
+get_timezone <- function(folder_prefix) {
+  if (folder_prefix %in% tz_map$UTC_5) {
+    return("America/New_York")  #UTC-5
+  } else if (folder_prefix %in% tz_map$UTC_6) {
+    return("America/Chicago")   #UTC-6
+  } else {
+    return("America/Los_Angeles")  #UTC-8
+  }
+}
+
+#Use only subjects from good_data list
+valid_subjects <- setdiff(names(good_data), format_log$Subject_ID)
+
+#Define batch size
+batch_size <- 50  #Adjust this based on your system's memory capacity
+num_batches <- ceiling(length(valid_subjects) / batch_size)
+
+#Initialize list to store processed data
+final_processed_data <- list()
+
+#Process data in batches
+for (batch_num in 1:num_batches) {
+  cat("Processing batch", batch_num, "of", num_batches, "\n")
+  
+  #Determine start and end indices for the current batch
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(valid_subjects))
+  batch_subjects <- valid_subjects[start_idx:end_idx]
+  
+  #Process each subject in the current batch
+  for (df_name in batch_subjects) {
+    #Extract the dataframe for the current subject
+    df <- good_data[[df_name]][[1]]
+    
+    #Skip this subject if the DF is empty or not a valid DF
+    if (is.null(df) || !is.data.frame(df)) {
+      cat("Skipping", df_name, "because the dataset is NULL or not a dataframe.\n")
+      next  #Move to the next iteration
+    }
+    
+    #Extract the first 4 characters to determine the timezone
+    folder_prefix <- substr(df_name, 1, 4)
+    tz <- get_timezone(folder_prefix)
+    
+    #Convert the "date" column to Date format (explicit format defined)
+    df$date <- as.Date(df$date, format = "%Y-%m-%d")
+    
+    #Create a POSIXct object at midnight UTC for date
+    df$UTC_time <- ymd_hms(paste(df$date, "00:00:00"), tz = "UTC")
+    
+    #Ensure minute is numeric
+    df$minute <- as.numeric(df$minute)
+    
+    #Add time offset to the UTC time to get the adjusted timestamp
+    df$UTC_adjusted <- df$UTC_time + minutes(df$minute)
+    
+    #Convert to the local timezone for this subject
+    df$local_time <- with_tz(df$UTC_adjusted, tzone = tz)
+    
+    #Store the modified dataframe in the final_processed_data list
+    final_processed_data[[df_name]] <- df
+  }
+  
+  #Clear memory after each batch
+  rm(batch_subjects, df, folder_prefix, tz)
+  gc()
+}
+
+#Change good_data to final_processed_data to be used from now on with converted times
+good_data <- final_processed_data
+rm(final_processed_data)
+#Save the final converted actigraphy dataset, overwriting existing data file
+save(good_data, file = ("actigraphy_data_1440.RData"))
+cat("Actigraphy data converted to appropriate timezone\n")
+#Clean up memory
+gc()
+```
+
+#Extract first N days of data
+
+#Non-wear, clipping detection, outliers 
+
+#Sleep scoring
+```{r Cole-Kripke}
+#Load the updated dataset with imputed data, used fixed weights as in GGIR
+load("actigraphy_data_1440.RData")
+
+batch_size <- 50  
+num_batches <- ceiling(length(full_day_1440_imputed) / batch_size)
+
+#Storage for sleep-scored data
+full_day_1440_sleep_scored <- list()
+
+#Cole-Kripke sleep detection function
+cole_kripke <- function(df) {
+  #Cole-Kripke Weights (Reversed Order)
+  ck_weights <- c(67, 74, 230, 76, 58, 54, 106)  
+
+  #Ensure at least 7 epochs exist to apply rolling window
+  if (nrow(df) < 7) {
+    cat("Skipping subject with insufficient data for sleep scoring\n")
+    return(df) #Return original df if not enough data points
+  }
+  
+  #Extract activity counts
+  activity_counts <- df$activity
+  
+  #Apply rolling window (centered at each point)
+  rolling_matrix <- rollapply(activity_counts, width = 7, 
+                              FUN = function(x) sum(x * ck_weights, na.rm = TRUE), 
+                              align = "center", fill = NA)
+
+  #Convert to Probability Score (PS)
+  PS <- rolling_matrix * 0.001
+
+  #Add 4 wake scores for first 4 epochs (to align with GGIR)
+  PS <- c(rep(2, 4), PS[5:length(PS)])  
+
+  #Classify sleep/wake based on PS threshold
+  df$sleep_wake <- ifelse(PS < 1, 1, 0)
+  
+  return(df)
+}
+
+for (batch_num in 1:num_batches) {
+  cat("\nProcessing batch", batch_num, "of", num_batches, "...\n")
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(full_day_1440_imputed))
+  batch_subjects <- names(full_day_1440_imputed)[start_idx:end_idx]
+  
+  #Apply sleep scoring to each subject in the batch
+  sleep_scored_batch <- lapply(batch_subjects, function(subject_name) {
+    df <- full_day_1440_imputed[[subject_name]]
+    
+    if (is.data.frame(df) && all(c("timestamp", "date", "activity") %in% colnames(df))) {
+      return(cole_kripke(df))  #Apply sleep scoring to all days
+    } else {
+      return(df)  #Return original if not a valid dataframe
+    }
+  })
+  
+  #Store batch results
+  for (i in seq_along(batch_subjects)) {
+    full_day_1440_sleep_scored[[batch_subjects[i]]] <- sleep_scored_batch[[i]]
+  }
+  
+  #Clean up memory
+  rm(batch_subjects, sleep_scored_batch)
+  gc()
+}
+
+#Save the sleep-scored dataset
+save(full_day_1440_sleep_scored, file = "actigraphy_data_sleep_scored.RData")
+
+cat("\nSleep scoring complete! Data saved.\n")
+
+#Generate Summary Report of Sleep Classification
+sleep_summary <- sapply(names(full_day_1440_sleep_scored), function(subject_name) {
+  df <- full_day_1440_sleep_scored[[subject_name]]
+  if (is.data.frame(df) && "sleep_wake" %in% colnames(df)) {
+    sleep_minutes <- sum(df$sleep_wake == 1, na.rm = TRUE)
+    total_minutes <- nrow(df)
+    return(c(sleep_minutes, total_minutes))
+  } else {
+    return(c(NA, NA))  #Return NA for invalid subjects
+  }
+})
+
+#Convert summary to data frame
+sleep_summary_df <- data.frame(
+  Subject = names(full_day_1440_sleep_scored),
+  Total_Sleep_Minutes = sleep_summary[1, ],
+  Total_Measured_Minutes = sleep_summary[2, ],
+  Sleep_Percentage = round((sleep_summary[1, ] / sleep_summary[2, ]) * 100, 2),
+  stringsAsFactors = FALSE
+)
+
+#Save the summary report
+write.csv(sleep_summary_df, file = "C:/Users/sefarrell/Downloads/sleep_summary.csv", row.names = FALSE)
+
+cat("\nSleep summary saved.\n")
+```
+
