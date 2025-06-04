@@ -1,0 +1,1879 @@
+---
+title: "STAGES workflow"
+author: "Seán F"
+date: "`r Sys.Date()`"
+output: html_document
+---
+#Load libraries
+```{r libs, include=FALSE}
+library(lubridate)
+library(jsonlite)
+library(readxl)
+library(assertthat)
+library(data.table)
+library(readr)
+library(ggplot2)
+library(sleepreg)
+library(circular)
+library(data.table)
+library(stringr)
+library(knitr)
+library(grid)
+library(zoo)
+library(gridExtra)
+library(writexl)
+library(tidyr)
+library(dplyr)
+library(kableExtra)
+```
+#Inital screening
+```{r Screen}
+#Initial screening, load excel file with all questionnaires and demographics as df
+screener <- "C:/Users/sefarrell/Downloads/STAGES things/Questionnaires/All participant demographics.csv"
+df <- read.csv(screener)
+
+#Define exclusion criteria
+excluded_crit <- df %>% filter(
+  sched_0510 == 1 |
+  mdhx_6200 == 1 |
+  cir_0100 == 1 |
+  narc_0050 == 1 |
+  mdhx_0400 %in% c(0,1,55)
+  )
+#Filter through df so only included subjects are kept 
+included_subjects <- df %>% filter (!subject_code %in% excluded_crit$subject_code)
+
+#Save initial screen as csv to make future analysis easier 
+write.csv(included_subjects,"C:/Users/sefarrell/Downloads/Eligible_Subjects_without_PSG.csv", row.names = FALSE)
+
+#Refine exclusion criteria to ensure included subjects have a corresponding PSG
+psg_file <- "C:/Users/sefarrell/Downloads/STAGES things/Questionnaires/STAGES_PSG_list.xlsx" 
+eligible_subjects_file <- "C:/Users/sefarrell/Downloads/Eligible_Subjects_without_PSG.csv"
+eligible_subjects <- read_csv(eligible_subjects_file) %>%
+  select(subject_code)
+
+#Load PSG data list
+psg_data <- read_excel(psg_file) %>%
+  rename(File_Name = Subject_Code)
+ #Remove trailing spaces from file name (there are loads after the .edf endnig for some reason)
+psg_data <- psg_data %>%
+  mutate(File_Name = str_squish(File_Name))
+#Subject_ID properly defined as some PSG entries are segmented 
+psg_data <- psg_data %>%
+  mutate(Subject_ID = gsub("_.*|\\.edf$|\\.csv$", "", File_Name))
+
+#Ensure that subject has .edf and .csv file 
+psg_summary <- psg_data %>%
+  group_by(Subject_ID) %>%
+  summarise(has_EDF = any(str_detect(File_Name, "\\.edf$")),
+  has_CSV = any(str_detect(File_Name, "\\.csv$"))
+  ) %>%
+  mutate(PSG_Complete = has_CSV & has_EDF)  #TRUE if both are present
+#merge with eligible subjects, ensuring column names match
+merged_data <- eligible_subjects %>%
+  rename(Subject_ID = subject_code) %>%   #Rename to match psg_summary
+  left_join(psg_summary, by = "Subject_ID")
+
+#Mark subjects with missing PSG data
+merged_data <- merged_data %>%
+  mutate(PSG_Status = case_when(
+   is.na(has_EDF) & is.na(has_CSV) ~ "Missing Both",
+    has_EDF == FALSE ~ "Missing EDF",
+    has_CSV == FALSE ~ "Missing CSV",
+    PSG_Complete == TRUE ~ "Complete",
+    TRUE ~ "Unknown",  #Just to identify any unexpected cases
+  ))
+#Count results
+num_complete <- sum(merged_data$PSG_Status == "Complete", na.rm = TRUE)
+num_missing <- sum(merged_data$PSG_Status != "Complete", na.rm = TRUE)
+
+#Create the summary statements
+initial_screen <- paste(nrow(included_subjects), "meet the initial inclusion criteria for this dataset.\n")
+psg_screen <- paste(num_complete, "eligible subjects have complete PSG data.\n")
+psg_missing <- paste(num_missing, "eligible subjects are missing PSG files.\n")
+summary_report <- paste("===== Summary of Screening=====\n",initial_screen, psg_screen, psg_missing, sep = "\n")
+#Write the combined summary report to a text file
+writeLines(summary_report, "C:/Users/sefarrell/Downloads/Summary_report_screening.txt")
+#Optionally, write the merged data to a CSV file
+write.csv(merged_data, "C:/Users/sefarrell/Downloads/Summary_report_screening.csv", row.names = FALSE)
+```
+#Load all data and choose selected subjects 
+```{r Data load, echo=FALSE}
+#Load eligible subjects from file
+eligible_subjects_file <- "C:/Users/sefarrell/Downloads/Eligible_Subjects_PSG_Check.csv"
+eligible_subjects <- read_csv(eligible_subjects_file) %>%
+  filter(psg_status == "Complete") %>%  #Keep only subjects with complete PSG data
+  select(Core_Subject_ID) %>%  #Keep subject IDs
+  pull()
+
+#Load actigraphy data from source folder, use batches for the sake of my laptop 
+actigraphy_folder <- 'C:/Users/sefarrell/Downloads/Actigraphy Final to Post/Actigraphy/Final to Post/'
+good_data <- list() #List for downstream processing
+bad_files <- list(
+  "Empty files" = character(),
+  "Invalid Structure" = character(),
+  "Parsing Failed" = character()
+) #This will hold subjects with missing/unreadable data 
+batch_size <- 80 #Can change batch size if running too slow/fast but this works well for mise 
+
+#ATM the data folders for each subject are stored as a list of all dirs in actigraphy folder, use recursive to list immediate subdirs in folder.
+subject_folders <- list.dirs(actigraphy_folder, recursive = FALSE, full.names = TRUE)
+subject_ids <- basename(subject_folders)
+subject_folders <- subject_folders[subject_ids %in% eligible_subjects]
+
+#Folders split into batches from seq of numbers from 1 to batch size. 
+subject_batches <- split(subject_folders, ceiling(seq_along(subject_folders) / batch_size))
+
+#Load .json file
+load_json_file <- function(file_path) {
+  #Read the file content
+  json_text <- tryCatch({
+    readLines(file_path, warn = FALSE) #reads line by line and prevents errors from being printed if there is an incomplete line
+  }, error = function(e) {
+    warning(paste("Failed to read file:", file_path, "Error:", e$message))
+    return(NA)
+  })
+  
+  #If the file is empty or couldn't be read, add it to bad_files and return NA
+  if (length(json_text) == 0 || all(is.na(json_text))) {
+    warning(paste("Empty file or read error:", file_path))
+    bad_files[["Empty files"]] <<- c(bad_files[["Empty files"]], file_path)
+    return(NA)
+  }
+  
+  #Skip to line that contains '{', the data starts here. Some of the .json's have a header some don't
+  json_start <- grep("\\{", json_text)[1]  
+  
+  #JSON's should be in a nested structure so if they are missing '{' the structure is bad
+  if (is.na(json_start)) {
+    warning(paste("Invalid structure:", file_path))
+    bad_files[["Invalid Structure"]] <<- c(bad_files[["Invalid Structure"]], file_path)
+    return(NA)
+  }
+  
+  #Get rid of the ugly stuff and keep the data 
+  clean_json <- paste(json_text[json_start:length(json_text)], collapse = "\n")
+  
+  #Convert to df, subjects go to bad files if they can't be loaded into df
+  tryCatch({
+    df <- fromJSON(clean_json, flatten = TRUE)
+    
+    #If 'items' exists but is an empty list, mark as bad file and return NA
+    if ("items" %in% names(df) && length(df$items) == 0) {
+      warning(paste("Empty 'items' JSON file:", file_path))
+      bad_files[["Empty files"]] <<- c(bad_files[["Empty files"]], file_path)
+      return(NA)  #Ignore this file
+    }
+    
+    #Extract data from "items"
+    if ("items" %in% names(df)) {
+      df <- df$items
+    }
+
+    #Ensure 'date' column is in appropriate date format, STAGES data in Y-D-M format which I don't like
+    df$date <- as.Date(df$date, format = "%Y-%m-%d")  
+    
+    #Convert to POSIXct timestamp using 'minute' column, time values computed as mins from 0-1439 in dataset
+    df$timestamp <- as.POSIXct(df$date, format = "%Y-%m-%d", tz = "UTC") + df$minute * 60  
+    
+    return(df)
+  }, error = function(e) {
+    warning(paste('Failed to load .json: ', file_path, "Error:", e$message))
+    bad_files[["Parsing Failed"]] <<- c(bad_files[["Parsing Failed"]], file_path)
+    return(NA)  #Mark as bad file
+  })
+}
+for (batch_num in seq_along(subject_batches)) {
+  cat("\nProcessing Batch", batch_num, "of", length(subject_batches), "...\n")
+  batch <- subject_batches[[batch_num]] #selects current batch_num
+  #Initialize temporary emtpy list to store batch data
+  batch_data <- list()
+  for (subject in batch) {
+    minbyminpath <- file.path(subject, "minbymin")
+    #If there's a valid min by min folder in subject folder then proceed with analysis
+    if (dir.exists(minbyminpath)) {
+      json_files <- list.files(path = minbyminpath, pattern = "*.json", full.names = TRUE)
+      #Read each JSON file and store in a list
+      subject_data <- lapply(json_files, function(file) { #use lapply in case of multiple .jsons
+        result <- load_json_file(file) #load json from prev function 
+        if (is.null(result) || all(is.na(result))) { #if all values missing OR all values NA 
+          cat("Skipped problematic file:", file, "\n")
+          return(NULL)  #Return NULL to skip this file
+        }
+        return(result)
+      })
+      #Remove NULL entries from subject data, these are the problem files 
+      subject_data <- Filter(Negate(is.null), subject_data) #in case .json wasn't read and null was returned
+      #Only save it there is actual output from subject 
+      if (length(subject_data) > 0) {
+        batch_data[[basename(subject)]] <- subject_data
+      } else {
+        cat("No valid data for subject:", basename(subject), "\n")
+      }
+    }
+  }
+  #Store good data in the main list
+  good_data <- c(good_data, batch_data)
+  #Clear temporary batch data and run garbage collection to free up memory
+  rm(batch_data)
+  gc()
+  cat("Finished Batch", batch_num, "\n")
+}
+
+#Summary of processing
+cat("\nAll batches processed successfully!\n")
+
+#Generate summary report
+summary_report <- paste("===== Summary of Problematic Files =====\n",
+  "Empty files:", length(bad_files[["Empty files"]]), "\n",
+  "Invalid structure:", length(bad_files[["Invalid Structure"]]), "\n",
+  "Parsing failed:", length(bad_files[["Parsing Failed"]]), "\n",
+  sep = ""
+)
+#Print summary report to console
+cat(summary_report)
+
+#Save summary report to a file
+write.csv(summary_report, "C:/Users/sefarrell/Downloads/Summary_report_screening.csv")
+
+#Save good data and bad files for later analysis
+save(good_data, file = "actigraphy1_data.RData")
+```
+#Date format check, DST, work and free days, add in season checker
+```{r Data format check}
+load("actigraphy1_data.RData")
+
+if (!exists("good_data")) {
+  stop("Error: 'good_data' not found")
+}
+cat("\n Loaded 'good_data' with", length(good_data), "subjects.\n")
+
+batch_size <- 50
+num_batches <- ceiling(length(good_data) / batch_size)
+
+required_columns <- c("timestamp", "date", "minute", "activeness")
+format_log <- data.frame(Subject_ID = character(), Issue = character(), stringsAsFactors = FALSE)
+
+#DST checker function
+check_dst_night <- function(date, tz = "Europe/London") {
+  splitdate <- unlist(strsplit(format(date, "%d/%m/%Y"), "/"))
+  t0 <- as.POSIXlt(paste0(splitdate[3], "-", splitdate[2], "-", splitdate[1], " 21:00:00"), tz = tz)
+  t1 <- as.POSIXlt(as.numeric(t0) + 3600 * 9, origin = "1970-01-01", tz = tz)
+  hoursinbetween <- as.numeric(format(seq(t0, t1, by = 3600), "%H"))
+  t1_hour <- as.numeric(format(t1, "%H")) + 24
+  t0_hour <- as.numeric(format(t0, "%H"))
+
+  if (t1_hour - t0_hour < 9) return(-1)
+  if (t1_hour - t0_hour > 9) return(1)
+  return(0)
+}
+
+#Work/free day labeling
+label_day_type <- function(date) {
+  wd <- lubridate::wday(date, label = TRUE, week_start = 1)
+  if (wd %in% c("Fri", "Sat")) return("free") else return("work")
+}
+
+#Season labeling
+label_season <- function(date) {
+  month <- as.integer(format(date, "%m"))
+  day <- as.integer(format(date, "%d"))
+
+  if ((month == 3 && day >= 1) || (month > 3 && month < 6) || (month == 5 && day <= 31)) {
+    return("Spring")
+  } else if ((month == 6 && day >= 1) || (month > 6 && month < 9) || (month == 8 && day <= 31)) {
+    return("Summer")
+  } else if ((month == 9 && day >= 1) || (month > 9 && month < 12) || (month == 11 && day <= 30)) {
+    return("Fall")
+  } else {
+    return("Winter")
+  }
+}
+
+#Process in batches
+for (batch_num in 1:num_batches) {
+  cat("Processing batch", batch_num, "of", num_batches, "\n")
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(good_data))
+  subject_ids <- names(good_data)[start_idx:end_idx]
+
+  for (subject_id in subject_ids) {
+    df <- good_data[[subject_id]][[1]]
+
+    if (!is.data.frame(df) || any(sapply(required_columns, function(col) !(col %in% colnames(df))))) {
+      format_log <- rbind(format_log, data.frame(Subject_ID = subject_id, Issue = "Missing or invalid structure"))
+      next
+    }
+
+    issues <- c()
+    if (!inherits(df$timestamp, "POSIXct")) issues <- c(issues, "timestamp not POSIXct")
+    if (!inherits(df$date, "Date")) issues <- c(issues, "date not Date")
+    if (!is.integer(df$minute)) issues <- c(issues, "minute not integer")
+    if (!is.numeric(df$activeness)) issues <- c(issues, "activeness not numeric")
+
+    if (length(issues) > 0) {
+      format_log <- rbind(format_log, data.frame(Subject_ID = subject_id, Issue = paste(issues, collapse = "; ")))
+      next
+    }
+
+    #Annotate DST, work/free, and season for each unique date
+    unique_dates <- unique(df$date)
+    dst_table <- data.frame(
+      date = unique_dates,
+      dst_flag = vapply(unique_dates, check_dst_night, numeric(1)),
+      day_type = vapply(unique_dates, label_day_type, character(1)),
+      season = vapply(unique_dates, label_season, character(1))
+    )
+
+    df <- dplyr::left_join(df, dst_table, by = "date")
+    good_data[[subject_id]][[1]] <- df
+  }
+
+  rm(subject_ids)
+  gc()
+}
+
+#Save updated good_data and format issues
+save(good_data, file = "actigraphy1_data.RData")
+cat("Updated 'good_data' saved.\n")
+
+write.csv(format_log, "C:/Users/sefarrell/Downloads/Data_Format_log.csv", row.names = FALSE)
+cat("Format issues logged to 'Data_Format_log.csv'\n")
+```
+#Extract valid days at different timepoints
+```{r Day extraction}
+load("actigraphy1_data.RData")
+batch_size <- 50
+num_batches <- ceiling(length(good_data) / batch_size)
+
+#full_day_600 <- list()
+full_day_960 <- list()
+#full_day_1080 <- list()
+#full_day_1440 <- list()
+
+classify_days_by_threshold <- function(df, threshold) {
+  day_counts <- aggregate(timestamp ~ date, data = df, FUN = length)
+  valid_dates <- day_counts$date[day_counts$timestamp >= threshold]
+  subset(df, date %in% valid_dates)
+}
+
+#Loop through and classify valid days for each threshold
+for (batch_num in 1:num_batches) {
+  cat("Processing batch", batch_num, "of", num_batches, "\n")
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(good_data))
+  batch_subjects <- names(good_data)[start_idx:end_idx]
+
+  for (subject in batch_subjects) {
+    df <- good_data[[subject]][[1]]
+    if (!is.data.frame(df) || !"timestamp" %in% names(df) || !"date" %in% names(df)) next
+
+    #Get valid days for each threshold
+    valid_600 <- classify_days_by_threshold(df, 600)
+    valid_960 <- classify_days_by_threshold(df, 960)
+    valid_1080 <- classify_days_by_threshold(df, 1080)
+    valid_1440 <- classify_days_by_threshold(df, 1440)
+
+    if (nrow(valid_600) > 0) full_day_600[[subject]] <- list(valid_600)
+    if (nrow(valid_960) > 0) full_day_960[[subject]] <- list(valid_960)
+    if (nrow(valid_1080) > 0) full_day_1080[[subject]] <- list(valid_1080)
+    if (nrow(valid_1440) > 0) full_day_1440[[subject]] <- list(valid_1440)
+  }
+
+  gc()
+}
+
+#Save all full-day .RData files
+#save(full_day_600, file = "full_day_600.RData")
+save(full_day_960, file = "full_day_960.RData")
+#save(full_day_1080, file = "full_day_1080.RData")
+#save(full_day_1440, file = "full_day_1440.RData")
+
+cat("Full day files saved successfully.\n")
+```
+#Day identification - checkpoint for actigraphy data.R
+```{r Valid day identification }
+#Threshold to be changed depednign on what you are testing
+current_threshold <- 960
+load(paste0("full_day_", current_threshold, ".RData"))
+full_day_list <- get(paste0("full_day_", current_threshold))
+rm(full_day_1080, full_day_1440, full_day_600, good_data)
+#Batch processing setup
+batch_size <- 100
+subject_ids <- names(full_day_list)
+subject_batches <- split(subject_ids, ceiling(seq_along(subject_ids) / batch_size))
+
+#Function to identify longest consecutive streak
+find_consecutive_streak <- function(date_list) {
+  dates <- sort(unique(as.Date(date_list)))
+  if (length(dates) < 2) {
+    return(list(streak = length(dates), start = min(dates), end = max(dates)))
+  }
+
+  streak_len <- 1
+  max_streak <- 1
+  start_idx <- 1
+  best_start_idx <- 1
+  best_end_idx <- 1
+
+  for (i in 2:length(dates)) {
+    if (as.numeric(dates[i] - dates[i - 1]) == 1) {
+      streak_len <- streak_len + 1
+    } else {
+      if (streak_len > max_streak) {
+        max_streak <- streak_len
+        best_start_idx <- start_idx
+        best_end_idx <- i - 1
+      }
+      streak_len <- 1
+      start_idx <- i
+    }
+  }
+
+  #Final pass
+  if (streak_len > max_streak) {
+    max_streak <- streak_len
+    best_start_idx <- start_idx
+    best_end_idx <- length(dates)
+  }
+
+  list(streak = max_streak, start = dates[best_start_idx], end = dates[best_end_idx])
+}
+
+#Summarize valid day info
+valid_day_summary <- list()
+
+for (batch_num in seq_along(subject_batches)) {
+  cat("Processing batch", batch_num, "of", length(subject_batches), "\n")
+  batch_ids <- subject_batches[[batch_num]]
+
+  for (subject in batch_ids) {
+    df <- full_day_list[[subject]][[1]]
+    if (!is.null(df) && "date" %in% colnames(df)) {
+      dates <- sort(unique(df$date))
+      valid_days <- length(dates)
+      streak_info <- find_consecutive_streak(dates)
+      first_date <- min(dates)
+      last_date <- max(dates)
+      expected_days <- as.integer(difftime(last_date, first_date, units = "days")) + 1
+      missing_flag <- expected_days != valid_days
+
+      valid_day_summary[[subject]] <- data.frame(
+        subject_code = subject,
+        first_date = first_date,
+        last_date = last_date,
+        expected_days = expected_days,
+        actual_days = valid_days,
+        missing_day_flag = missing_flag,
+        Consecutive_Days = streak_info$streak,
+        Streak_Start = streak_info$start,
+        Streak_End = streak_info$end,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  gc()
+}
+valid_days_df <- do.call(rbind, valid_day_summary)
+
+#Add rule-based flags
+get_subjects_by_rule <- function(min_consec, min_valid) {
+  valid_days_df$actual_days >= min_valid &
+  valid_days_df$Consecutive_Days >= min_consec
+}
+
+#subjects_10c14v <- valid_days_df$subject_code[get_subjects_by_rule(10, 14)]
+subjects_14c14v <- valid_days_df$subject_code[get_subjects_by_rule(14, 14)]
+#subjects_21c21v <- valid_days_df$subject_code[get_subjects_by_rule(21, 21)]
+
+#Filter and save for each rule
+save_threshold_data <- function(subjects, rule_name) {
+  subset_data <- full_day_list[subjects]
+  save(subset_data, file = paste0("filtered_", current_threshold, "_", rule_name, ".RData"))
+
+  count_df <- data.frame(
+    Threshold = current_threshold,
+    Rule = rule_name,
+    N_Subjects = length(subjects)
+  )
+  write.csv(count_df,
+            paste0("C:/Users/sefarrell/Downloads/count_", current_threshold, "_", rule_name, ".csv"),
+            row.names = FALSE)
+}
+
+#save_threshold_data(subjects_10c14v, "10c14v")
+save_threshold_data(subjects_14c14v, "14c14v")
+#save_threshold_data(subjects_21c21v, "21c21v")
+
+#valid_days_df$rule_10c14v <- with(valid_days_df, actual_days >= 14 & Consecutive_Days >= 10)
+valid_days_df$rule_14c14v <- with(valid_days_df, actual_days >= 14 & Consecutive_Days >= 14)
+#valid_days_df$rule_21c21v <- with(valid_days_df, actual_days >= 21 & Consecutive_Days >= 21)
+
+#Save detailed summary file
+write.csv(valid_days_df,
+          file = paste0("C:/Users/sefarrell/Downloads/valid_days_summary_", current_threshold, ".csv"),
+          row.names = FALSE)
+
+cat("Done processing threshold", current_threshold, "\n")
+```
+#Extract first 14 days from each subject so dataset is of same length for each subject
+```{r Extraction}
+#Load the already filtered 960_14c14v dataset
+load("filtered_960_14c14v.RData")
+
+#Initialize new list to store extracted 14-day sets
+extracted_days <- list()
+
+#Batch settings
+batch_size <- 50
+subject_ids <- names(subset_data)
+num_batches <- ceiling(length(subject_ids) / batch_size)
+subject_batches <- split(subject_ids, ceiling(seq_along(subject_ids) / batch_size))
+
+#Loop through each batch
+for (batch_num in seq_along(subject_batches)) {
+  cat("Processing batch", batch_num, "of", length(subject_batches), "\n")
+  
+  batch_subjects <- subject_batches[[batch_num]]
+
+  for (subject_id in batch_subjects) {
+    df <- subset_data[[subject_id]][[1]]
+
+    if (!is.data.frame(df) || !"date" %in% colnames(df)) next
+    
+    #Get sorted unique dates
+    unique_dates <- sort(unique(df$date))
+    
+    #Find first streak of 14 consecutive dates
+    consecutive_count <- 1
+    start_idx <- 1
+    found <- FALSE
+
+    for (i in 2:length(unique_dates)) {
+      if (as.integer(unique_dates[i] - unique_dates[i - 1]) == 1) {
+        consecutive_count <- consecutive_count + 1
+        if (consecutive_count == 14) {
+          found <- TRUE
+          break
+        }
+      } else {
+        consecutive_count <- 1
+        start_idx <- i
+      }
+    }
+    
+    if (found) {
+      #Extract minute-by-minute data for these 14 days
+      streak_dates <- unique_dates[(i - 13):i]
+      extracted_df <- df[df$date %in% streak_dates, ]
+      
+      extracted_days[[subject_id]] <- list(extracted_df)
+    } else {
+      cat(subject_id, "→ No valid 14-day streak found, skipping\n")
+    }
+  }
+  
+  #Clean up memory
+  gc()
+}
+
+#Save the extracted dataset
+save(extracted_days, file = ("extracted_actigraphy_data_960.RData"))
+```
+#Identify missing timepoints and mark for downstream imputation, 
+```{r Imputation id}
+#Load the data
+load("extracted_actigraphy_data_960.RData")
+extracted_days_flat <- lapply(extracted_days, function(x) {
+  if (is.list(x) && length(x) == 1 && is.data.frame(x[[1]])) {
+    return(x[[1]])
+  } else {
+    return(NULL)
+  }
+})
+
+split_subject_days <- function(df) {
+  if (!is.data.frame(df)) return(list())
+  if (!"timestamp" %in% names(df)) return(list())
+  if (!inherits(df$timestamp, "POSIXct")) return(list())
+
+  df <- df[order(df$timestamp), ]
+  df <- df[!is.na(df$timestamp), ]
+  if (nrow(df) == 0) return(list())
+
+  df$day <- as.Date(df$timestamp)
+  day_list <- split(df, df$day)
+
+  #Filter out any day without valid timestamps
+  day_list <- Filter(function(x) nrow(x) > 0 && all(!is.na(x$timestamp)), day_list)
+  return(day_list)
+}
+
+extracted_days <- lapply(extracted_days_flat, split_subject_days)
+
+mark_missing_data <- function(df) {
+  df <- df[order(as.numeric(df$timestamp)), ]
+  df$imputed_flag <- 0
+  inserted_rows <- list()
+  tz <- attr(df$timestamp, "tzone")
+  if (is.null(tz)) tz <- "UTC"
+
+  for (i in seq_len(nrow(df) - 1)) {
+    prev_time <- df$timestamp[i]
+    next_time <- df$timestamp[i + 1]
+    gap <- as.numeric(difftime(next_time, prev_time, units = "secs")) / 60
+
+    if (gap > 1.01) {
+      missing_times <- seq(from = prev_time + 60, to = next_time - 60, by = 60)
+      for (mt in missing_times) {
+        new_row <- df[i, , drop = FALSE]
+        new_row$timestamp <- as.POSIXct(mt, origin = "1970-01-01", tz = tz)
+        if ("activeness" %in% colnames(new_row)) new_row$activeness <- NA
+        new_row$imputed_flag <- -1
+        inserted_rows <- append(inserted_rows, list(new_row))
+      }
+    }
+  }
+
+  if (length(inserted_rows) > 0) {
+    inserted_df <- do.call(rbind, inserted_rows)
+    df <- rbind(df, inserted_df)
+    df <- df[order(df$timestamp), ]
+  }
+
+  return(df)
+}
+
+pad_day_to_1440 <- function(df) {
+  if (nrow(df) == 0) return(df)
+  tz <- attr(df$timestamp, "tzone")
+  if (is.null(tz)) tz <- "UTC"
+
+  day_start <- as.POSIXct(format(df$timestamp[1], "%Y-%m-%d 00:00:00"), tz = tz)
+  full_timestamps <- data.frame(timestamp = seq(from = day_start, by = "1 min", length.out = 1440))
+
+  #Preserve day_type and season
+  day_type_val <- if ("day_type" %in% names(df)) na.omit(df$day_type)[1] else NA
+  season_val   <- if ("season"   %in% names(df)) na.omit(df$season)[1]   else NA
+
+  df_padded <- merge(full_timestamps, df, by = "timestamp", all.x = TRUE)
+  df_padded$imputed_flag[is.na(df_padded$imputed_flag)] <- -1
+  df_padded$day_type[is.na(df_padded$day_type)] <- day_type_val
+  df_padded$season[is.na(df_padded$season)]     <- season_val
+
+  return(df_padded)
+}
+
+#batch process
+subject_ids <- names(extracted_days)
+batch_size <- 50
+num_batches <- ceiling(length(subject_ids) / batch_size)
+
+marked_data <- list()
+imputation_summary <- data.frame(
+  Subject = character(),
+  Original_Epochs = integer(),
+  Final_Epochs = integer(),
+  Missing_Timepoints_Marked = integer(),
+  stringsAsFactors = FALSE
+)
+problem_subjects <- c()
+
+for (batch_num in seq_len(num_batches)) {
+  cat("Processing batch", batch_num, "of", num_batches, "...\n")
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(subject_ids))
+  batch_ids <- subject_ids[start_idx:end_idx]
+
+  for (subject_id in batch_ids) {
+    subject_days <- extracted_days[[subject_id]]
+    processed_days <- list()
+    original_epochs <- 0
+    final_epochs <- 0
+    total_missing <- 0
+
+    for (day_idx in seq_along(subject_days)) {
+      df <- subject_days[[day_idx]]
+      original_epochs <- original_epochs + nrow(df)
+
+      marked_df <- mark_missing_data(df)
+      padded_df <- pad_day_to_1440(marked_df)
+
+      final_epochs <- final_epochs + nrow(padded_df)
+      total_missing <- total_missing + sum(padded_df$imputed_flag == -1, na.rm = TRUE)
+
+      processed_days[[day_idx]] <- padded_df
+    }
+
+    #Validate structure
+    valid_lengths <- sapply(processed_days, function(df) nrow(df) == 1440)
+    if (length(processed_days) != 14 || !all(valid_lengths)) {
+      problem_subjects <- c(problem_subjects, subject_id)
+    }
+
+    marked_data[[subject_id]] <- processed_days
+
+    imputation_summary <- rbind(imputation_summary, data.frame(
+      Subject = subject_id,
+      Original_Epochs = original_epochs,
+      Final_Epochs = final_epochs,
+      Missing_Timepoints_Marked = total_missing
+    ))
+  }
+
+  gc()
+}
+
+#Save outputs
+write.csv(imputation_summary,
+          file = "C:/Users/sefarrell/Downloads/imputation_summary_all_subjects.csv",
+          row.names = FALSE)
+save(marked_data, file = "extracted1_actigraphy_data_960.RData")
+
+#Optional: flag problems
+if (length(problem_subjects) > 0) {
+  cat("Subjects with invalid data (not 14 days of 1440 mins):\n")
+  print(problem_subjects)
+} else {
+  cat("All subjects passed 14 x 1440 check.\n")
+}
+
+cat("Imputation summary saved.\n")
+```
+#Clipping detection, outliers 
+```{r Clipping detection, outliers}
+
+#Load Data and Initialize
+previous_data_file <- "extracted1_actigraphy_data_960.RData"
+if (file.exists(previous_data_file)) {
+  cat("Loading previously saved data...\n")
+  load(previous_data_file)  #loads extracted_days
+} else {
+  stop("Error: Data file not found!")
+}
+
+
+#Define Clipping Function
+detect_clipping_outliers <- function(df, subject_id) {
+  clip_threshold <- quantile(df$activeness, 0.99, na.rm = TRUE)
+  df$clipped_flag <- ifelse(df$activeness > clip_threshold, 1, 0)
+
+  window_size <- 10
+  sd_threshold <- 3
+  df$outlier_flag <- 0
+
+  if (nrow(df) > window_size) {
+    roll_mean <- zoo::rollapply(df$activeness, width = window_size, FUN = mean, fill = NA, align = "center", na.rm = TRUE)
+    roll_sd   <- zoo::rollapply(df$activeness, width = window_size, FUN = sd, fill = NA, align = "center", na.rm = TRUE)
+    df$outlier_flag <- ifelse(abs(df$activeness - roll_mean) > sd_threshold * roll_sd, 1, 0)
+  }
+
+  df$impute_later_flag <- ifelse(df$clipped_flag == 1 | df$outlier_flag == 1, 1, 0)
+  return(df)
+}
+
+
+#Batch Process Clipping Flags
+subject_ids <- names(extracted_days)
+batch_size <- 50
+num_batches <- ceiling(length(subject_ids) / batch_size)
+clipping_results <- list()
+
+for (batch_num in 1:num_batches) {
+  cat("\nProcessing Batch", batch_num, "of", num_batches, "...\n")
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(subject_ids))
+  batch_ids <- subject_ids[start_idx:end_idx]
+
+  for (subject_id in batch_ids) {
+    subject_days <- extracted_days[[subject_id]]
+    processed_days <- list()
+
+    for (day_idx in seq_along(subject_days)) {
+      df <- subject_days[[day_idx]]
+      if (is.data.frame(df) && "activeness" %in% names(df)) {
+        df_clipped <- detect_clipping_outliers(df, subject_id)
+        processed_days[[day_idx]] <- df_clipped
+      }
+    }
+
+    if (length(processed_days) > 0) {
+      clipping_results[[subject_id]] <- processed_days
+    } else {
+      cat("Skipping:", subject_id, "- No valid data\n")
+    }
+  }
+
+  gc()
+}
+
+
+#Generate Summary Report
+
+summary_report <- data.frame(
+  Subject_ID = subject_ids,
+  Clipped_Values = sapply(subject_ids, function(id) {
+    sum(sapply(clipping_results[[id]], function(df) sum(df$clipped_flag, na.rm = TRUE)))
+  }),
+  Outlier_Values = sapply(subject_ids, function(id) {
+    sum(sapply(clipping_results[[id]], function(df) sum(df$outlier_flag, na.rm = TRUE)))
+  }),
+  Total_Minutes = sapply(subject_ids, function(id) {
+    sum(sapply(clipping_results[[id]], nrow))
+  }),
+  Clipped_Percentage = sapply(subject_ids, function(id) {
+    dfs <- clipping_results[[id]]
+    flags <- unlist(lapply(dfs, function(df) df$clipped_flag))
+    round(mean(flags, na.rm = TRUE) * 100, 2)
+  }),
+  Outlier_Percentage = sapply(subject_ids, function(id) {
+    dfs <- clipping_results[[id]]
+    flags <- unlist(lapply(dfs, function(df) df$outlier_flag))
+    round(mean(flags, na.rm = TRUE) * 100, 2)
+  })
+)
+
+
+#Save Results
+write.csv(summary_report, "C:/Users/sefarrell/Downloads/clipping_outliers_summary.csv", row.names = FALSE)
+save(clipping_results, file = "C:/Users/sefarrell/Downloads/full_day_960_clipped.RData")
+
+cat("Clipping & Outlier Detection Complete! Summary saved.\n")
+
+```
+#Handle non-wear
+```{r Non-wear}
+#Load data clipped
+clip_file <- "C:/Users/sefarrell/Downloads/full_day_960_clipped.RData"
+load(clip_file)
+if (!exists("clipping_results")) stop("Object 'clipping_results' not found in ", clip_file)
+
+#Define Choi non-wear function
+apply_choi <- function(df, activity_col = "axis1",
+                       min_period_len = 90, min_window_len = 30,
+                       spike_tolerance = 2) {
+  stopifnot(min_window_len >= spike_tolerance)
+  
+  df %>%
+    mutate(count = .data[[activity_col]],
+           wear  = as.integer(count > 0)) %>%
+    group_by(rleid = data.table::rleid(wear)) %>%
+    summarise(wear = first(wear),
+              timestamp = first(timestamp),
+              length = n(),
+              .groups = "drop") %>%
+    mutate(wear = if_else(wear == 0L & length < spike_tolerance, 1L, wear)) %>%
+    group_by(rleid = data.table::rleid(wear)) %>%
+    summarise(wear = first(wear),
+              timestamp = first(timestamp),
+              length = sum(length),
+              .groups = "drop") %>%
+    mutate(wear = if_else(
+      wear == 1L & length <= spike_tolerance &
+        lead(length, default = 0L) >= min_window_len &
+        lag(length, default = 0L) >= min_window_len,
+      0L, wear)) %>%
+    group_by(rleid = data.table::rleid(wear)) %>%
+    summarise(wear = first(wear),
+              timestamp = first(timestamp),
+              length = sum(length),
+              .groups = "drop") %>%
+    filter(wear == 0L, length >= min_period_len) %>%
+    mutate(period_end = timestamp + as.difftime(length, units = "mins")) %>%
+    select(period_start = timestamp, period_end, length)
+}
+
+
+#Batch processing
+
+subject_ids <- names(clipping_results)
+batch_size <- 50
+num_batches <- ceiling(length(subject_ids) / batch_size)
+nonwear_flagged_data <- list()
+nonwear_summary <- data.frame(
+  Subject_ID = character(),
+  Total_Minutes = integer(),
+  Nonwear_Minutes = integer(),
+  Nonwear_Pct = numeric(),
+  Zero_Count = integer(),
+  Zero_Pct = numeric(),
+  stringsAsFactors = FALSE
+)
+
+validation_log <- file("C:/Users/sefarrell/Downloads/nonwear_validation_log.txt", "w")
+writeLines("Subject_ID,Total_Minutes,Nonwear_Minutes,Expected_Nonwear,Difference,Zero_Count", validation_log)
+
+for (b in seq_len(num_batches)) {
+  cat("Choi batch", b, "of", num_batches, "...\n")
+  ids <- subject_ids[((b - 1) * batch_size + 1):min(b * batch_size, length(subject_ids))]
+
+  for (id in ids) {
+    cat("Processing subject:", id, "\n")
+
+    subject_days <- clipping_results[[id]]
+    processed_days <- list()
+    total_nonwear_mins <- 0
+    zero_count_total <- 0
+    total_minutes <- 0
+
+    for (day_idx in seq_along(subject_days)) {
+      df <- subject_days[[day_idx]]
+      if (!is.data.frame(df) || !"timestamp" %in% names(df)) next
+      if (!"axis1" %in% names(df)) df <- dplyr::rename(df, axis1 = activeness)
+      if (!inherits(df$timestamp, "POSIXct")) df$timestamp <- as.POSIXct(df$timestamp, tz = "UTC")
+
+      #Count zeros
+      zero_count <- sum(df$axis1 == 0, na.rm = TRUE)
+      zero_count_total <- zero_count_total + zero_count
+      total_minutes <- total_minutes + nrow(df)
+
+      #Apply Choi
+      nw <- apply_choi(df, activity_col = "axis1")
+
+      df$non_wear <- 1L  #default = wear
+      if (nrow(nw) > 0) {
+        for (i in seq_len(nrow(nw))) {
+          mask <- df$timestamp >= nw$period_start[i] & df$timestamp < nw$period_end[i]
+          df$non_wear[mask] <- 0L
+        }
+        total_nonwear_mins <- total_nonwear_mins + sum(df$non_wear == 0L, na.rm = TRUE)
+      }
+
+      df <- dplyr::rename(df, activeness = axis1)
+      processed_days[[day_idx]] <- df
+    }
+
+    if (length(processed_days) == 0) next
+
+    #Combine all days into 1 data.frame
+    combined_df <- do.call(rbind, processed_days)
+    total_flagged <- sum(combined_df$non_wear == 0L, na.rm = TRUE)
+    nonwear_pct <- round(total_flagged / total_minutes * 100, 2)
+    zero_pct <- round(zero_count_total / total_minutes * 100, 2)
+
+    nonwear_flagged_data[[id]] <- list(combined_df)
+
+    #Log discrepancy
+    if (abs(total_flagged - total_nonwear_mins) > 10) {
+      line <- paste(id, total_minutes, total_flagged, total_nonwear_mins,
+                    total_flagged - total_nonwear_mins, zero_count_total, sep = ",")
+      writeLines(line, validation_log)
+    }
+
+    nonwear_summary <- rbind(nonwear_summary, data.frame(
+      Subject_ID = id,
+      Total_Minutes = total_minutes,
+      Nonwear_Minutes = total_flagged,
+      Nonwear_Pct = nonwear_pct,
+      Zero_Count = zero_count_total,
+      Zero_Pct = zero_pct
+    ))
+
+    cat("  Summary:", total_flagged, "non-wear minutes of", total_minutes, 
+        "(", nonwear_pct, "%)\n")
+  }
+
+  gc()
+}
+
+close(validation_log)
+
+#Stats + saving
+cat("\nOverall non-wear statistics:\n")
+cat("Mean non-wear percentage:", round(mean(nonwear_summary$Nonwear_Pct), 2), "%\n")
+cat("Median non-wear percentage:", round(median(nonwear_summary$Nonwear_Pct), 2), "%\n")
+cat("Max non-wear percentage:", round(max(nonwear_summary$Nonwear_Pct), 2), "%\n")
+cat("Min non-wear percentage:", round(min(nonwear_summary$Nonwear_Pct), 2), "%\n")
+cat("Subjects with >30% non-wear:", sum(nonwear_summary$Nonwear_Pct > 30), "\n")
+cat("Subjects with >50% non-wear:", sum(nonwear_summary$Nonwear_Pct > 50), "\n")
+
+cat("\nZero activity vs Non-wear correlation:\n")
+cat("Correlation coefficient:", round(cor(nonwear_summary$Zero_Pct, nonwear_summary$Nonwear_Pct), 3), "\n")
+
+write.csv(nonwear_summary,
+          file = "C:/Users/sefarrell/Downloads/nonwear_summary.csv",
+          row.names = FALSE)
+
+save(nonwear_flagged_data,
+     file = "extracted_actigraphy_data_960_nonwear.RData")
+
+cat("Non-wear detection complete. Summary and flagged data saved.\n")
+cat("Validation log saved to: C:/Users/sefarrell/Downloads/nonwear_validation_log.txt\n")
+
+```
+#Imputation of marked values (threshold 25%)
+```{r 25% impute}
+load("C:/Users/sefarrell/Documents/STAGES/Rdata/extracted_actigraphy_data_960_nonwear.RData")
+
+#Initialize
+subject_ids <- names(nonwear_flagged_data)
+#Function to enforce full 14-day coverage with exactly 20160 timestamps
+pad_to_full_14days <- function(df) {
+  start_date <- floor_date(min(df$timestamp), unit = "day")
+  end_time <- as.POSIXct(start_date + days(14), tz = "UTC") - minutes(1)
+
+  full_times <- seq(from = as.POSIXct(start_date, tz = "UTC"),
+                    to = end_time,
+                    by = "1 min")
+
+  df_full <- tibble(timestamp = full_times) %>%
+    left_join(df, by = "timestamp")
+
+  #Properly assign imputed_flag: 0 = from original data, -1 = new padded
+  df_full$imputed_flag <- ifelse(!is.na(df_full$activeness), 0, -1)
+
+  #Fill other flags safely
+  df_full$impute_later_flag <- if ("impute_later_flag" %in% names(df_full)) coalesce(df_full$impute_later_flag, 0) else 0
+  df_full$non_wear <- if ("non_wear" %in% names(df_full)) coalesce(df_full$non_wear, 0) else 1
+
+  return(df_full)
+}
+
+batch_size <- 50
+num_batches <- ceiling(length(subject_ids) / batch_size)
+imputed_data <- list()
+imputation_summary <- data.frame(
+  Subject_ID = character(),
+  Total_Minutes = integer(),
+  Total_Imputed = integer(),
+  From_Missing = integer(),
+  From_ClippingOutlier = integer(),
+  From_Nonwear = integer(),
+  Imputed_Pct = numeric(),
+  stringsAsFactors = FALSE
+)
+
+#Tracking
+total_subjects <- length(subject_ids)
+passed_subjects <- 0
+
+for (batch_num in seq_len(num_batches)) {
+  cat("Processing batch", batch_num, "of", num_batches, "...\n")
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(subject_ids))
+  batch_ids <- subject_ids[start_idx:end_idx]
+
+  for (subject_id in batch_ids) {
+  df_raw <- nonwear_flagged_data[[subject_id]][[1]]
+  df <- pad_to_full_14days(df_raw)
+
+    if (!"activeness" %in% names(df)) stop("Missing 'activeness'")
+    if (!"timestamp" %in% names(df)) stop("Missing 'timestamp'")
+    if (!"imputed_flag" %in% names(df)) df$imputed_flag <- 0
+    if (!"impute_later_flag" %in% names(df)) df$impute_later_flag <- 0
+    if (!"non_wear" %in% names(df)) df$non_wear <- 1
+
+    total_minutes <- 14 * 1440
+
+    df$minute_of_day <- as.integer(format(df$timestamp, "%H")) * 60 +
+                        as.integer(format(df$timestamp, "%M"))
+    df$original_activeness <- df$activeness
+
+    minute_means <- df %>%
+      filter(imputed_flag == 0, impute_later_flag == 0,
+             non_wear == 1, !is.na(activeness)) %>%
+      group_by(minute_of_day) %>%
+      summarise(mean_activity = mean(activeness), .groups = "drop")
+
+    df <- df %>%
+      left_join(minute_means, by = "minute_of_day") %>%
+      mutate(
+        overall_mean = mean(df$activeness[df$non_wear == 1], na.rm = TRUE),
+        imputation_reason = case_when(
+          is.na(original_activeness) | imputed_flag == -1 ~ "Missing Timestamp",
+          impute_later_flag == 1                         ~ "Clipping/Outlier",
+          non_wear == 0                                   ~ "Non-wear",
+          TRUE                                            ~ NA_character_
+        ),
+        was_imputed = !is.na(imputation_reason),
+        mean_to_use = ifelse(is.na(mean_activity), overall_mean, mean_activity),
+        activeness = ifelse(was_imputed, mean_to_use, activeness)
+      ) %>%
+      select(-overall_mean, -mean_to_use)
+
+    reason_counts <- table(df$imputation_reason[df$was_imputed == 1])
+    reasons <- names(reason_counts)
+    from_missing <- if ("Missing Timestamp" %in% reasons) reason_counts["Missing Timestamp"] else 0
+    from_clipping <- if ("Clipping/Outlier" %in% reasons) reason_counts["Clipping/Outlier"] else 0
+    from_nonwear <- if ("Non-wear" %in% reasons) reason_counts["Non-wear"] else 0
+    total_imputed <- from_missing + from_clipping + from_nonwear
+    total_imputed <- ifelse(is.na(total_imputed), 0, total_imputed)
+
+    imputed_pct <- round((total_imputed / total_minutes) * 100, 2)
+
+    #Enforce full 14-day dataset and ≤25% imputation
+    if (nrow(df) == total_minutes && !is.na(imputed_pct) && imputed_pct <= 25) {
+      imputed_data[[subject_id]] <- list(df)
+      passed_subjects <- passed_subjects + 1
+      cat("  ✓ Subject", subject_id, "retained (", imputed_pct, "% imputed)\n")
+    } else {
+      cat("  ✗ Subject", subject_id, "excluded —", nrow(df), "rows,", imputed_pct, "% imputed\n")
+    }
+
+    imputation_summary <- rbind(imputation_summary, data.frame(
+      Subject_ID = subject_id,
+      Total_Minutes = nrow(df),
+      Total_Imputed = total_imputed,
+      From_Missing = from_missing,
+      From_ClippingOutlier = from_clipping,
+      From_Nonwear = from_nonwear,
+      Imputed_Pct = imputed_pct,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  gc()
+}
+
+#Save final outputs
+save(imputed_data, file = "extracted_actigraphy_data_960_imputed_cleaned.RData")
+writexl::write_xlsx(imputation_summary, "C:/Users/sefarrell/Downloads/imputation_summary_25_filtered.xlsx")
+
+retention_rate <- round((passed_subjects / total_subjects) * 100, 2)
+retention_report <- data.frame(
+  Original_Subjects = total_subjects,
+  Retained_Subjects = passed_subjects,
+  Excluded_Subjects = total_subjects - passed_subjects,
+  Retention_Rate_Pct = retention_rate
+)
+write.csv(retention_report, "C:/Users/sefarrell/Downloads/subject_retention_report.csv", row.names = FALSE)
+
+cat("\nImputation complete.\n")
+cat("Retained", passed_subjects, "out of", total_subjects, "subjects (", retention_rate, "% retention rate)\n")
+cat("Subjects with >25% imputation or incomplete data were excluded.\n")
+```
+#DST checker
+```{r DST checker}
+  #Load the imputed dataset
+load("extracted_actigraphy_data_960_imputed_cleaned.RData")
+
+#Function to detect DST transition for a given date and tz
+#Safer function: takes a Date object directly
+check_dst_night <- function(date, tz = "UTC") {
+  t0 <- as.POSIXlt(as.POSIXct(paste(date, "21:00:00"), tz = tz), tz = tz)
+  t1 <- as.POSIXlt(as.numeric(t0) + 3600 * 9, origin = "1970-01-01", tz = tz)
+
+  hoursinbetween <- as.numeric(format(seq(t0, t1, by = 3600), "%H"))
+  t1h <- as.numeric(format(t1, "%H")) + 24
+  t0h <- as.numeric(format(t0, "%H"))
+
+  if (t1h - t0h < 9) {
+    dst_night_or_not <- -1
+    dsthour <- hoursinbetween[duplicated(hoursinbetween)]
+  } else if (t1h - t0h > 9) {
+    dst_night_or_not <- 1
+    expectedhours <- c(21:23, 0:7)
+    dsthour <- setdiff(expectedhours, hoursinbetween)[1]
+  } else {
+    dst_night_or_not <- 0
+    dsthour <- NA
+  }
+
+  return(list(dst_night_or_not = dst_night_or_not, dsthour = dsthour))
+}
+
+#Call with Date object directly
+res <- check_dst_night(as.Date(d, origin = "1970-01-01"), tz = attr(df$timestamp, "tzone"))
+
+#Extract DST transitions per subject per day
+dst_summary <- data.frame(
+  Subject_ID = character(),
+  Date = character(),
+  DST_Status = integer(),
+  DST_Hour = integer(),
+  stringsAsFactors = FALSE
+)
+
+for (subject_id in names(imputed_data)) {
+  df <- imputed_data[[subject_id]][[1]]
+  df$date <- as.Date(df$timestamp)
+
+  #Loop over unique dates (should be 14)
+  for (d in unique(df$date)) {
+    d_parsed <- as.Date(d, origin = "1970-01-01")  #Ensure Date format
+    res <- check_dst_night(d_parsed, tz = attr(df$timestamp, "tzone"))  #This was missing inside the loop
+
+    dst_summary <- rbind(dst_summary, data.frame(
+      Subject_ID = subject_id,
+      Date = as.character(d_parsed),
+      DST_Status = res$dst_night_or_not,
+      DST_Hour = ifelse(length(res$dsthour) > 0, res$dsthour, NA)
+    ))
+  }
+}
+
+
+#Save or inspect results
+write.csv(dst_summary, "C:/Users/sefarrell/Downloads/dst_transition_nights.csv", row.names = FALSE)
+cat("DST transition summary saved.\n")
+
+```
+#Sleep scoring
+```{r Cole-Kripke scoring}
+#Load imputed data
+load("extracted_actigraphy_data_960_imputed_cleaned.RData")
+
+#Check that imputed_data exists 
+if (!exists("imputed_data")) {
+  stop("Error: imputed_data not found. Make sure you've run the imputation step first.")
+}
+
+#Load the imputation summary
+imputation_summary_file <- "C:/Users/sefarrell/Downloads/imputation_summary_25_filtered.xlsx"
+if (!file.exists(imputation_summary_file)) {
+  stop("Error: Imputation summary file not found. Run the imputation step first.")
+}
+
+imputation_summary <- readxl::read_xlsx(imputation_summary_file)
+
+#Verify imputation percentages and filter subjects
+imputation_summary <- imputation_summary %>%
+  mutate(
+    #Calculate actual percentage (double-check the calculation)
+    Calculated_Pct = Total_Imputed / (14 * 1440) * 100,
+    #Flag any discrepancies in the reported vs. calculated percentage
+    Pct_Error = abs(Imputed_Pct - Calculated_Pct) > 0.1
+  )
+
+#Print warnings for any discrepancies
+if (any(imputation_summary$Pct_Error)) {
+  cat("WARNING: Discrepancies found in imputation percentages. Recalculating...\n")
+  #List the discrepancies
+  discrepancies <- imputation_summary %>% filter(Pct_Error)
+  print(discrepancies %>% select(Subject_ID, Imputed_Pct, Calculated_Pct))
+}
+
+#Filter to only include subjects with ≤25% imputation
+valid_subjects <- imputation_summary %>%
+  filter(Imputed_Pct <= 25) %>%
+  pull(Subject_ID)
+
+#Check that valid subjects exist in the imputed_data
+missing_subjects <- setdiff(valid_subjects, names(imputed_data))
+if (length(missing_subjects) > 0) {
+  cat("WARNING:", length(missing_subjects), "subjects in imputation summary are missing from imputed_data.\n")
+  cat("First few missing subjects:", paste(head(missing_subjects, 5), collapse = ", "), "\n")
+  #Remove missing subjects from valid_subjects
+  valid_subjects <- intersect(valid_subjects, names(imputed_data))
+}
+
+#Report on filtering
+cat("Filtering subjects based on imputation threshold:\n")
+cat("- Total subjects in imputation summary:", nrow(imputation_summary), "\n")
+cat("- Subjects with ≤25% imputation:", length(valid_subjects), "\n")
+cat("- Subjects excluded due to >25% imputation:", 
+    nrow(imputation_summary) - length(valid_subjects), "\n")
+
+#Create output folder if it doesn't exist
+output_dir <- "C:/Users/sefarrell/Downloads/scored_epochs"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+#Cole-Kripke function
+cole_kripke <- function(df) {
+  ck_weights <- c(106, 54, 58, 76, 230, 74, 67)
+  activity <- ifelse(is.na(df$activeness), 0, df$activeness)
+  rolling_score <- zoo::rollapply(activity, width = 7, FUN = function(x) sum(x * ck_weights),
+                                  fill = NA, align = "center")
+  PS <- rolling_score * 0.001
+  PS[1:4] <- 2  #dummy wake
+  df$sleep_wake <- ifelse(PS < 1, 1, 0)
+  return(df)
+}
+
+#Process subjects in batches
+batch_size <- 50
+num_batches <- ceiling(length(valid_subjects) / batch_size)
+
+#Track successful and failed subjects
+successful_subjects <- character()
+failed_subjects <- character()
+
+for (batch_num in seq_len(num_batches)) {
+  cat("\nScoring batch", batch_num, "of", num_batches, "\n")
+  
+  #Get batch subjects
+  start_idx <- (batch_num - 1) * batch_size + 1
+  end_idx <- min(batch_num * batch_size, length(valid_subjects))
+  batch_subjects <- valid_subjects[start_idx:end_idx]
+  
+  for (subject_id in batch_subjects) {
+    cat("  Processing subject", subject_id, "...\n")
+    
+    #Verify subject exists in imputed_data
+    if (!subject_id %in% names(imputed_data)) {
+      cat("    ERROR: Subject not found in imputed_data\n")
+      failed_subjects <- c(failed_subjects, subject_id)
+      next
+    }
+    
+    #Extract imputation percentage
+    imputed_pct <- imputation_summary %>%
+      filter(Subject_ID == subject_id) %>%
+      pull(Imputed_Pct)
+    
+    #Double-check imputation threshold
+    if (is.null(imputed_pct) || length(imputed_pct) == 0 || imputed_pct > 25) {
+      cat("    SKIPPING: Subject exceeds 25% imputation threshold or has missing data\n")
+      failed_subjects <- c(failed_subjects, subject_id)
+      next
+    }
+    
+    #Get data and process
+    tryCatch({
+      df <- imputed_data[[subject_id]][[1]]
+      
+      #Verify data structure
+      if (!is.data.frame(df) || nrow(df) == 0 || !"activeness" %in% names(df)) {
+        cat("    ERROR: Invalid data structure\n")
+        failed_subjects <- c(failed_subjects, subject_id)
+        next
+      }
+      
+      #Prepare data for scoring
+      df <- df %>%
+        mutate(timestamp = as.POSIXct(timestamp)) %>%
+        arrange(timestamp)
+      
+      #Apply Cole-Kripke algorithm
+      scored_df <- cole_kripke(df)
+      
+      #Save results
+      out_path <- file.path(output_dir, paste0(subject_id, "_scored_epochs.csv"))
+      write.csv(scored_df[, c("timestamp", "activeness", "sleep_wake")],
+                out_path, row.names = FALSE)
+      
+      #Track success
+      successful_subjects <- c(successful_subjects, subject_id)
+      
+      cat("    ✓ Successfully scored and saved\n")
+    }, error = function(e) {
+      cat("    ERROR:", e$message, "\n")
+      failed_subjects <- c(failed_subjects, subject_id)
+    })
+  }
+  
+  #Clean up memory
+  gc()
+}
+
+#Summary report
+cat("\nCole-Kripke scoring complete!\n")
+cat("Summary:\n")
+cat("- Total subjects attempted:", length(valid_subjects), "\n")
+cat("- Successfully scored:", length(successful_subjects), "\n")
+cat("- Failed:", length(failed_subjects), "\n")
+
+#Save list of successful subjects for downstream analysis
+successful_df <- data.frame(
+  Subject_ID = successful_subjects,
+  stringsAsFactors = FALSE
+)
+
+write.csv(successful_df, 
+          file.path(output_dir, "successfully_scored_subjects.csv"), 
+          row.names = FALSE)
+
+#Log failures if any occurred
+if (length(failed_subjects) > 0) {
+  failed_df <- data.frame(
+    Subject_ID = failed_subjects,
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(failed_df,
+            file.path(output_dir, "failed_scored_subjects.csv"),
+            row.names = FALSE)
+}
+
+cat("\nScored files saved to:", output_dir, "\n")
+cat("Lists of successful and failed subjects saved to the same directory.\n")
+```
+#Interdaily stability
+```{r Interdaily stability}
+#Input and output folders
+input_dir <- "C:/Users/sefarrell/Downloads/scored_epochs"
+output_dir <- "C:/Users/sefarrell/Downloads/IS_scores"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+#Interdaily Stability Calculation
+calculate_is <- function(df) {
+  df <- df %>%
+    mutate(
+      minute_of_day = hour(timestamp) * 60 + minute(timestamp),
+      day = as.Date(timestamp)
+    )
+
+  #p = minutes per day, N = total number of samples
+  p <- 1440
+  N <- nrow(df)
+
+  x_bar <- mean(df$sleep_wake, na.rm = TRUE)
+
+  #Mean for each time-of-day across days
+  Xh <- df %>%
+    group_by(minute_of_day) %>%
+    summarise(Xh_bar = mean(sleep_wake, na.rm = TRUE), .groups = "drop")
+
+  numerator <- N * sum((Xh$Xh_bar - x_bar)^2)
+  denominator <- p * sum((df$sleep_wake - x_bar)^2)
+
+  IS <- numerator / denominator
+  return(IS)
+}
+
+#List of all subject CSVs
+subject_files <- list.files(input_dir, full.names = TRUE, pattern = "_scored_epochs\\.csv$")
+IS_summary <- data.frame(Subject_ID = character(), IS = numeric(), stringsAsFactors = FALSE)
+
+#Loop through each subject
+for (f in subject_files) {
+  subject_id <- gsub("_scored_epochs\\.csv", "", basename(f))
+
+  df <- read_csv(f, show_col_types = FALSE)
+  df <- df %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "UTC")) %>%
+    filter(!is.na(sleep_wake))  #Remove NA rows
+
+  IS_value <- calculate_is(df)
+
+  #Save per-subject result
+  write.csv(data.frame(Subject_ID = subject_id, IS = IS_value),
+            file.path(output_dir, paste0(subject_id, "_IS.csv")), row.names = FALSE)
+
+  IS_summary <- rbind(IS_summary, data.frame(Subject_ID = subject_id, IS = IS_value))
+}
+
+#Save combined IS summary
+write_xlsx(IS_summary, file.path(output_dir, "IS_summary_all_subjects.xlsx"))
+
+cat("Interdaily Stability (IS) scores computed and saved to:", output_dir, "\n")
+
+```
+#Sleep onset, offset and midsleep 
+```{r On off mid}
+scored_dir <- "C:/Users/sefarrell/Downloads/scored_epochs"
+output_rdata <- "C:/Users/sefarrell/Downloads/l5_onset_offset_metrics_10min.RData"
+metrics_dir <- "C:/Users/sefarrell/Downloads/l5_sleep_outputs"
+dir.create(metrics_dir, showWarnings = FALSE)
+
+batch_size <- 50
+files <- list.files(scored_dir, pattern = "_scored_epochs\\.csv$", full.names = TRUE)
+batches <- split(files, ceiling(seq_along(files) / batch_size))
+all_results <- list()
+
+fix_first_row <- function(file) {
+  lines <- readLines(file)
+  if (length(lines) > 1 && grepl("^\\d{4}-\\d{2}-\\d{2},", lines[2]) && !grepl("\\d{2}:\\d{2}:\\d{2}", lines[2])) {
+    lines[2] <- sub("^(\\d{4}-\\d{2}-\\d{2}),", "\\1 00:00:00,", lines[2])
+    writeLines(lines, file)
+  }
+}
+
+read_scored_file <- function(file) {
+  fix_first_row(file)
+  tryCatch({
+    df <- readr::read_csv(file, show_col_types = FALSE) %>%
+      dplyr::mutate(timestamp = as.POSIXct(timestamp, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+    if (any(is.na(df$timestamp))) stop("Invalid timestamps")
+    return(df)
+  }, error = function(e) {
+    message("Error reading ", file, ": ", e$message)
+    return(NULL)
+  })
+}
+
+find_sleep_onset <- function(day_data, min_duration = 10) {
+  for (i in 1:(nrow(day_data) - min_duration + 1)) {
+    window <- day_data$sleep_wake[i:(i + min_duration - 1)]
+    if (sum(is.na(window)) == 0 && sum(window == 1) >= min_duration - 1) {
+      return(day_data$timestamp[i])
+    }
+  }
+  return(NA)
+}
+
+find_sleep_offset <- function(day_data, min_duration = 10, onset_time) {
+  if (is.na(onset_time)) return(NA)
+  post_onset <- day_data %>% dplyr::filter(timestamp > onset_time)
+  n <- nrow(post_onset)
+  if (n < min_duration) return(NA)
+  for (i in (n - min_duration + 1):1) {
+    window <- post_onset$sleep_wake[i:(i + min_duration - 1)]
+    if (sum(is.na(window)) == 0 && sum(window == 1) >= min_duration - 1) {
+      return(post_onset$timestamp[i + min_duration - 1])
+    }
+  }
+  return(NA)
+}
+
+label_day_type_window <- function(date) {
+  wd <- weekdays(as.Date(date))
+  if (wd %in% c("Friday", "Saturday")) return("free") else return("work")
+}
+
+
+label_season <- function(date) {
+  m <- lubridate::month(date)
+  d <- lubridate::day(date)
+  if ((m == 3 && d >= 1) || (m > 3 && m < 6)) return("Spring")
+  if ((m == 6 && d >= 1) || (m > 6 && m < 9)) return("Summer")
+  if ((m == 9 && d >= 1) || (m > 9 && m < 12)) return("Fall")
+  return("Winter")
+}
+
+for (b in seq_along(batches)) {
+  cat( "Processing batch", b, "of", length(batches), "\n")
+  batch <- batches[[b]]
+  batch_results <- list()
+
+  for (file in batch) {
+    subject_id <- stringr::str_replace(basename(file), "_scored_epochs\\.csv$", "")
+    df <- read_scored_file(file)
+    if (is.null(df) || nrow(df) == 0) {
+      cat("Skipped:", subject_id, "(unreadable)\n")
+      next
+    }
+
+    df <- df %>%
+      dplyr::mutate(
+        sleep_wake = as.numeric(sleep_wake),
+        activeness = as.numeric(activeness)
+      )
+
+    all_dates <- sort(unique(as.Date(df$timestamp)))
+    subject_results <- list()
+    if (length(all_dates) > 1) {
+      for (i in seq_len(length(all_dates) - 1)) {
+        ws <- as.POSIXct(paste0(format(all_dates[i], "%Y-%m-%d"), " 12:00:00"), tz = "UTC")
+        we <- as.POSIXct(paste0(format(all_dates[i+1], "%Y-%m-%d"), " 12:00:00"), tz = "UTC")
+        l5_df <- df %>% filter(timestamp >= ws, timestamp < we) %>% arrange(timestamp)
+        if (nrow(l5_df) < 10) next
+
+        l5_df <- l5_df %>%
+          mutate(roll_5h = zoo::rollapply(activeness, 300, mean, fill = NA, align = "center"))
+        valid_idx <- which(!is.na(l5_df$roll_5h))
+        if (length(valid_idx) == 0) next
+
+        l5_idx    <- valid_idx[which.min(l5_df$roll_5h[valid_idx])]
+        l5_center <- l5_df$timestamp[l5_idx]
+
+        guider_data <- df %>%
+          filter(timestamp >= l5_center - hours(6),
+                 timestamp <= l5_center + hours(6)) %>%
+          arrange(timestamp)
+
+        onset  <- find_sleep_onset(guider_data)
+        offset <- find_sleep_offset(guider_data, onset_time = onset)
+        if (is.na(onset) || is.na(offset) || offset <= onset) next
+
+        midsleep     <- onset + (offset - onset) / 2
+        duration_min <- as.numeric(difftime(offset, onset, units = "mins"))
+
+        subject_results[[length(subject_results) + 1]] <- tibble::tibble(
+          subject_id    = subject_id,
+          window_start  = ws,
+          window_end    = we,
+          l5_center     = l5_center,
+          onset         = onset,
+          offset        = offset,
+          midsleep      = midsleep,
+          duration_mins = duration_min
+        )
+      }
+    }
+
+    subject_df <- dplyr::bind_rows(subject_results)
+
+if (nrow(subject_df) >= 13) {
+  subject_df <- subject_df %>%
+    dplyr::mutate(
+      #NEW (recommended change):
+      day_type = sapply(as.Date(window_start), label_day_type),
+      season = sapply(as.Date(offset), label_season)
+    )
+  readr::write_csv(subject_df, file = file.path(metrics_dir, paste0(subject_id, "_sleep_metrics.csv")))
+  batch_results[[subject_id]] <- subject_df
+  cat("  Saved:", subject_id, "(", nrow(subject_df), "bouts)\n")
+} else {
+  cat(" Excluded:", subject_id, "- only", nrow(subject_df), "bouts\n")
+}
+
+
+  all_results[[b]] <- dplyr::bind_rows(batch_results)
+}
+
+final_df <- dplyr::bind_rows(all_results)
+
+if (nrow(final_df) > 0) {
+  final_df <- final_df %>%
+    dplyr::mutate(
+      day_type = sapply(as.Date(window_start), label_day_type),
+      season = sapply(as.Date(offset), label_season)
+    )
+  save(final_df, file = output_rdata)
+  readr::write_csv(final_df, file = sub("\\.RData$", ".csv", output_rdata))
+}
+
+}
+```
+#Sleep regularity index
+```{r SRI}
+
+#SRI in GGIR is derived from the detected rest periods (sustained inactivity bouts) and does not discriminate specifically between the main sleep window and naps. I used this approach because we do not have a robust nap detection method yet.
+
+scored_dir <- "C:/Users/sefarrell/Downloads/scored_epochs"
+binary_dir <- "C:/Users/sefarrell/Downloads/binary_sleep_data"
+dir.create(binary_dir, showWarnings = FALSE, recursive = TRUE)
+
+subject_files <- list.files(scored_dir, pattern = "_scored_epochs\\.csv$", full.names = TRUE)
+batches <- split(subject_files, ceiling(seq_along(subject_files) / 50))
+
+for (b in seq_along(batches)) {
+  cat("Batch", b, "of", length(batches), "\n")
+  for (file_path in batches[[b]]) {
+    subject_id <- gsub("_scored_epochs\\.csv$", "", basename(file_path))
+
+    #Quietly try to read the file
+    df <- tryCatch(
+      suppressMessages(readr::read_csv(file_path, show_col_types = FALSE)),
+      error = function(e) {
+        cat("Could not read file for", subject_id, "\n")
+        return(NULL)
+      }
+    )
+    if (is.null(df) || !all(c("timestamp", "sleep_wake") %in% names(df))) {
+      cat("⚠️ Skipping", subject_id, "- required columns missing\n")
+      next
+    }
+
+    #Convert and save as binary
+    df <- df %>%
+      mutate(
+        timestamp = as.POSIXct(timestamp, tz = "UTC"),
+        unix_timestamp = as.numeric(timestamp)
+      ) %>%
+      arrange(unix_timestamp) %>%
+      distinct(unix_timestamp, .keep_all = TRUE) %>%
+      select(sleep_wake, unix_timestamp)
+
+    if (any(diff(df$unix_timestamp) <= 0, na.rm = TRUE)) {
+      cat("⚠️ Skipping", subject_id, "- timestamps not strictly increasing\n")
+      next
+    }
+
+    write.table(df,
+                file = file.path(binary_dir, paste0(subject_id, "_binary.csv")),
+                sep = ",", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  }
+}
+
+
+#Convert to SWS
+cat("Converting to SWS format...\n")
+SWS_from_binarySW(
+  binarySWdir = binary_dir,
+  tsCol = 2,
+  binaryCol = 1
+)
+
+#Compute SRI scores
+cat("Running SRI scoring...\n")
+SRI_from_binary(
+  binarydir = file.path(binary_dir, "SWS_output"),
+  alloutdir = file.path(binary_dir, "SRI_output"),
+  col.trans = 1,
+  col.timestamp = 2,
+  tz = "UTC",
+  overwr = TRUE,
+  wr.raster = TRUE,
+  minSRIdays = 5
+)
+
+cat("SRI computation complete. Outputs saved in: SRI_output\n")
+```
+#Composite phase deviation
+```{r CPD}
+#read in sleep scored .csv, CPD removes first night
+sleep_times <- ("C:/Users/sefarrell/Downloads/l5_onset_offset_metrics_10min.csv")
+
+df <- read.csv(sleep_times)
+
+compute_cpd_subject <- function(subj_df, key) {
+  subj_df <- subj_df %>%
+    mutate(
+      midsleep_time = ymd_hms(midsleep),
+      midsleep_hour = hour(midsleep_time) + minute(midsleep_time)/60 + second(midsleep_time)/3600,
+      midsleep_rad = circular(midsleep_hour / 24 * 2 * pi, units = "radians", modulo = "2pi")
+    ) %>%
+    arrange(midsleep_time)
+  
+  msf_mean_rad <- mean(subj_df$midsleep_rad, na.rm = TRUE)
+  
+  subj_df <- subj_df %>%
+    mutate(
+      midsleep_rad_lag = lag(midsleep_rad)
+    )
+  
+  circular_dist_hrs <- function(a, b) {
+    x <- as.numeric(a)
+    y <- as.numeric(b)
+    diff <- atan2(sin(x - y), cos(x - y))
+    abs(diff) * 24 / (2 * pi)
+  }
+  
+  subj_df <- subj_df %>%
+    mutate(
+      xi = circular_dist_hrs(msf_mean_rad, midsleep_rad),
+      yi = circular_dist_hrs(midsleep_rad_lag, midsleep_rad),
+      cpd = sqrt(xi^2 + yi^2)
+    )
+  
+  subj_df <- subj_df %>% filter(!is.na(cpd))
+  mean_cpd <- mean(subj_df$cpd, na.rm = TRUE)
+  n_nights <- nrow(subj_df)
+  
+  tibble(
+    subject_id = key$subject_id,
+    n_nights = n_nights,
+    mean_cpd = mean_cpd
+  )
+}
+
+all_cpd <- df %>%
+  group_by(subject_id) %>%
+  group_map(compute_cpd_subject) %>%
+  bind_rows()
+
+write.csv(all_cpd, "C:/Users/sefarrell/Downloads/composite_phase_deviation_all_subjects.csv", row.names = FALSE)
+print("Saved mean CPD for all subjects to 'composite_phase_deviation_all_subjects.csv'")
+
+```
+#Standard deviation
+```{r Std. dev}
+load("C:/Users/sefarrell/Downloads/l5_onset_offset_metrics_10min.RData")  #loads final_df
+
+#Helper: convert POSIXct to minutes since midnight
+time_to_min <- function(x) {
+  h <- as.numeric(format(x, "%H"))
+  m <- as.numeric(format(x, "%M"))
+  s <- as.numeric(format(x, "%S"))
+  h * 60 + m + s / 60
+}
+
+#Helper: circular SD function (returns hours now)
+circular_sd_hours <- function(mins) {
+  radians <- circular((mins %% 1440) / 1440 * 2 * pi, units = "radians")
+  sd_min <- as.numeric(sd.circular(radians)) * (1440 / (2 * pi))
+  return(sd_min / 60)  #convert to hours
+}
+
+#Compute variability per subject
+sleep_stdevs <- final_df %>%
+  mutate(
+    onset_min = time_to_min(onset),
+    offset_min = time_to_min(offset),
+    midsleep_min = time_to_min(midsleep),
+    duration_hours = duration_mins / 60
+  ) %>%
+  group_by(subject_id) %>%
+  summarise(
+    n_days = n(),
+    onset_sd_hours = circular_sd_hours(onset_min),
+    offset_sd_hours = circular_sd_hours(offset_min),
+    midsleep_sd_hours = circular_sd_hours(midsleep_min),
+    duration_sd_hours = sd(duration_hours, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+#Save output
+write.csv(sleep_stdevs, "C:/Users/sefarrell/Downloads/sleep_circular_stddev_HOURS.csv", row.names = FALSE)
+cat("✅ Circular SDs saved in HOURS (onset/offset/midsleep), duration SD in MINUTES.\n")
+```
+#SJL 
+```{r SJL}
+#Function: convert POSIXct/character to minutes since midnight
+time_to_min <- function(x) {
+  #Ensure POSIXct; if already, will do nothing
+  x <- as.POSIXct(x, tz = "UTC")
+  h <- as.numeric(format(x, "%H"))
+  m <- as.numeric(format(x, "%M"))
+  s <- as.numeric(format(x, "%S"))
+  h * 60 + m + s / 60
+}
+
+#Circular mean of times (in minutes since midnight)
+circular_mean_hours <- function(mins) {
+  radians <- circular((mins %% 1440) / 1440 * 2 * pi, units = "radians")
+  mean_min <- as.numeric(mean.circular(radians)) * (1440 / (2 * pi))
+  #Convert back to hours (0-24)
+  mean_min <- mean_min %% 1440
+  return(mean_min / 60)
+}
+
+#**NEW**: Circular difference in hours, always between -12 and 12
+circular_diff_hours <- function(a, b) {
+  diff <- (a - b + 12) %% 24 - 12
+  return(diff)
+}
+
+metrics_dir <- "C:/Users/sefarrell/Downloads/l5_sleep_outputs"
+metrics_files <- list.files(metrics_dir, pattern = "_sleep_metrics\\.csv$", full.names = TRUE)
+all_df <- purrr::map_dfr(metrics_files, read_csv, show_col_types = FALSE)
+
+#Use window_start as unique day for each sleep window
+all_df <- all_df %>%
+  mutate(
+    window_day = as.Date(window_start),
+    midsleep_min = time_to_min(midsleep)
+  )
+
+#Only include participants with exactly 13 windows (bouts)
+valid_ids <- all_df %>%
+  group_by(subject_id) %>%
+  summarise(n_windows = n_distinct(window_day), .groups = "drop") %>%
+  filter(n_windows == 13) %>%
+  pull(subject_id)
+
+filtered_df <- all_df %>%
+  filter(subject_id %in% valid_ids)
+
+day_counts <- filtered_df %>%
+  count(subject_id, day_type) %>%
+  pivot_wider(names_from = day_type, values_from = n, names_prefix = "n_")
+if (!"n_work" %in% names(day_counts)) day_counts$n_work <- 0
+if (!"n_free" %in% names(day_counts)) day_counts$n_free <- 0
+day_counts <- day_counts %>%
+  mutate(flag_unexpected_distribution = (n_work + n_free != 13))
+
+#Per subject, calculate mean midsleep per day_type using circular mean
+sjl_df <- filtered_df %>%
+  group_by(subject_id, day_type) %>%
+  summarise(
+    midsleep_mean_hr = circular_mean_hours(midsleep_min),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = day_type,
+    values_from = midsleep_mean_hr,
+    names_prefix = "MS_"
+  )
+
+#Fill missing columns
+if (!"MS_work" %in% names(sjl_df)) sjl_df$MS_work <- NA_real_
+if (!"MS_free" %in% names(sjl_df)) sjl_df$MS_free <- NA_real_
+
+#Circular SJL calculation
+sjl_df <- sjl_df %>%
+  filter(!is.na(MS_work) & !is.na(MS_free)) %>%
+  mutate(SJL = circular_diff_hours(MS_free, MS_work))
+
+sjl_combined <- sjl_df %>%
+  left_join(day_counts, by = "subject_id") %>%
+  select(subject_id, MS_free, MS_work, SJL, n_work, n_free, flag_unexpected_distribution)
+
+write.csv(sjl_combined, "C:/Users/sefarrell/Downloads/social_jetlag_13window_from_outputs.csv", row.names = FALSE)
+cat("SJL values saved.\n")
+```
+

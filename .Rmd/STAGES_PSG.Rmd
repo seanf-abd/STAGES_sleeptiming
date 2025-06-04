@@ -1,0 +1,592 @@
+---
+title: "STAGES PSG"
+author: "Seán F"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r Load Libraries, include = FALSE}
+library(lubridate)
+library(readr)
+library(readxl)  
+library(ggplot2)
+library(ggdist)
+library(gghalves)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(jsonlite)
+```
+# Load Data and Initial Cleaning
+```{r Load data, include=FALSE}
+#LPSG_folder <- "C:/Users/sefarrell/Documents/STAGES/PSG_Scores"
+id_file <- "C:/Users/sefarrell/Downloads/sleep_timing_measures/sleep_circular_stddev_HOURS.csv"
+
+subject_ids <- read.csv(id_file, stringsAsFactors = FALSE) %>%
+  pull(subject_id) %>%
+  unique() %>%
+  as.character()
+
+all_psg_files <- list.files(PSG_folder, pattern = "\\.csv$", full.names = TRUE)
+psg_file_ids <- str_remove(basename(all_psg_files), "\\.csv$")
+valid_psg_files <- all_psg_files[psg_file_ids %in% subject_ids]
+
+batch_size <- 50
+batches <- split(valid_psg_files, ceiling(seq_along(valid_psg_files)/batch_size))
+
+results_list <- list()
+batch_counter <- 1
+
+# Track exclusions
+failed_files <- character(0)
+no_event_files <- character(0)
+processed_ids <- character(0)
+all_attempted_ids <- character(0)
+
+for (batch in batches) {
+  cat("Processing batch", batch_counter, "of", length(batches), "\n")
+  for (file in batch) {
+    this_id <- str_remove(basename(file), "\\.csv$")
+    all_attempted_ids <- c(all_attempted_ids, this_id)
+    
+    lines <- tryCatch({
+      read_lines(file)
+    }, error = function(e) {
+      cat("Completely unreadable file:", file, "--", e$message, "\n")
+      failed_files <<- c(failed_files, this_id)
+      return(NULL)
+    })
+    if (is.null(lines) || length(lines) < 2) {
+      cat("Empty or unreadable file for", this_id, "\n")
+      failed_files <- c(failed_files, this_id)
+      next
+    }
+    
+    header <- strsplit(lines[1], ",")[[1]]
+    max_cols <- max(sapply(strsplit(lines, ","), length))
+    data <- do.call(rbind, lapply(lines[-1], function(x) {
+      vals <- strsplit(x, ",")[[1]]
+      length(vals) <- max_cols
+      vals
+    }))
+    cn <- c(header, paste0("extra_", seq_len(max_cols - length(header))))
+    length(cn) <- max_cols
+    colnames(data) <- cn
+    data <- as.data.frame(data, stringsAsFactors = FALSE)
+    
+    # Now extract event columns from 3rd onward
+    event_start <- 3
+    event_cols <- seq(event_start, ncol(data))
+    data$Event_Combined <- apply(data[, event_cols, drop = FALSE], 1, function(row) {
+      paste(na.omit(trimws(as.character(row))), collapse = " ")
+    })
+    data$Event_clean <- ifelse(!is.na(data[[event_start]]) & trimws(data[[event_start]]) != "",
+                               trimws(data[[event_start]]),
+                               trimws(data$Event_Combined))
+    
+    valid_events <- c("Wake", "Stage1", "Stage2", "Stage3", "REM")
+    data <- data[tolower(data$Event_clean) %in% tolower(valid_events), ]
+    if (nrow(data) == 0) {
+      cat("No valid events for", this_id, "-- unique Events (after cleaning):", paste(unique(data$Event_clean), collapse=", "), "\n")
+      no_event_files <- c(no_event_files, this_id)
+      results_list[[this_id]] <- NULL
+      next
+    }
+    
+    # Standardize duration column
+    duration_names <- names(data)[grepl("duration", names(data), ignore.case = TRUE)]
+    if (length(duration_names) > 0) {
+      suppressWarnings({
+        data$Duration_seconds <- as.numeric(data[[duration_names[1]]])
+      })
+    } else {
+      data$Duration_seconds <- NA
+    }
+    
+    data$Subject_ID <- this_id
+    results_list[[this_id]] <- data
+    processed_ids <- c(processed_ids, this_id)
+    cat("Processed:", this_id, "(", nrow(data), "events)\n")
+  }
+  batch_counter <- batch_counter + 1
+  cat("End of batch\n")
+}
+
+# --- POST-PROCESS: REMOVE NULLs, BIND, SUMMARIZE ---
+results_list <- results_list[!sapply(results_list, is.null)]
+
+if (length(results_list) > 0) {
+  common_names <- Reduce(union, lapply(results_list, names))
+  for (i in seq_along(results_list)) {
+    for (col in common_names) {
+      if (!(col %in% names(results_list[[i]]))) {
+        results_list[[i]][[col]] <- NA
+      }
+      if (col == "Duration_seconds") {
+        suppressWarnings({
+          results_list[[i]][[col]] <- as.numeric(results_list[[i]][[col]])
+        })
+      }
+    }
+    results_list[[i]] <- results_list[[i]][, common_names]
+  }
+  all_psg_data <- bind_rows(results_list)
+  cat("Total subjects processed:", length(results_list), "\n")
+  cat("Total PSG events:", nrow(all_psg_data), "\n")
+} else {
+  cat("No valid PSG data found.\n")
+}
+
+# --- Missing log ---
+missing_ids <- setdiff(subject_ids, processed_ids)
+cat("\n==== Summary of Exclusions ====\n")
+cat(length(missing_ids), "subject IDs missing from processed data.\n")
+cat(length(failed_files), "files were unreadable/empty.\n")
+cat(length(no_event_files), "files had no valid events.\n\n")
+
+if (length(missing_ids) > 0) writeLines(missing_ids, "missing_ids.txt")
+if (length(failed_files) > 0) writeLines(failed_files, "failed_files.txt")
+if (length(no_event_files) > 0) writeLines(no_event_files, "no_event_files.txt")
+
+print(missing_ids)
+
+# --- FINAL CLEANING: TRIMMED PSG DATA ---
+clean_psg_trim <- all_psg_data %>%
+  transmute(
+    Subject_ID = Subject_ID,
+    Start_Time = `Start Time`,
+    Event = Event_clean,
+    time_sec = period_to_seconds(hms(`Start Time`)),
+    day_shift = c(0, cumsum(diff(period_to_seconds(hms(`Start Time`))) < 0)),
+    Date = as.Date("2000-01-01") + day_shift,
+    Start_Time_full = as.POSIXct(paste(Date, `Start Time`), tz = "UTC"),
+    Next_Time_full = lead(Start_Time_full),
+    Computed_Duration_sec = as.numeric(difftime(lead(Start_Time_full), Start_Time_full, units = "secs")),
+    Duration_seconds = Duration_seconds # keep this for logic below
+  ) %>%
+  group_by(Subject_ID) %>%
+  mutate(
+    Computed_Duration_sec = if_else(
+      row_number() == n(),
+      if_else(
+        Event %in% c('Stage1','Stage2','Stage3','REM') & !is.na(Duration_seconds) & Duration_seconds > 0,
+        Duration_seconds,
+        NA_real_
+      ),
+      Computed_Duration_sec
+    )
+  ) %>%
+  ungroup() %>%
+  select(
+    Subject_ID,
+    Start_Time,
+    Start_Time_full,
+    Event,
+    Computed_Duration_sec
+  )
+
+```
+#WASO function
+```{r WASO, echo=FALSE}
+# Function to calculate WASO in seconds and minutes
+calculate_WASO <- function(csv_file) {
+  sleep_stages <- c('Stage1', 'Stage2', 'Stage3', 'REM')
+  # Sleep onset = first sleep stage
+  sleep_onset_row <- which(csv_file$Event %in% sleep_stages)[1]
+  # Sleep offset = last sleep stage
+  sleep_offset_row <- tail(which(csv_file$Event %in% sleep_stages), 1)
+  if (is.na(sleep_onset_row) || is.na(sleep_offset_row) || sleep_offset_row <= sleep_onset_row) {
+    return(data.frame(waso_sec = 0, waso_min = 0))
+  }
+  # Only sum Wake events between onset and offset (exclusive)
+  wake_rows <- which(
+    csv_file$Event == "Wake" &
+      seq_len(nrow(csv_file)) > sleep_onset_row &
+      seq_len(nrow(csv_file)) < sleep_offset_row
+  )
+  waso_sec <- sum(csv_file$Computed_Duration_sec[wake_rows], na.rm = TRUE)
+  waso_min <- waso_sec / 60
+  data.frame(waso_sec = waso_sec, waso_min = waso_min)
+}
+
+# Apply to each subject in your PSG data
+waso_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ calculate_WASO(.x)) %>%
+  ungroup()
+
+print(waso_table)
+
+
+```
+#Total sleep time
+```{r TST, echo=FALSE}
+calculate_TST <- function(csv_file) {
+  # Only count true sleep stages
+  sleep_epochs <- csv_file %>% filter(Event %in% c('Stage1', 'Stage2', 'Stage3', 'REM'))
+  
+  # If none, return 0
+  if (nrow(sleep_epochs) == 0) return(0)
+  
+  # Sum actual durations between epochs
+  tst_sec <- sum(sleep_epochs$Computed_Duration_sec, na.rm = TRUE)
+  tst_min <- tst_sec / 60
+  
+  return(tst_min)
+}
+
+tst_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(TST_min = calculate_TST(.x))) %>%
+  ungroup()
+
+print(tst_table)
+
+# For any problem subject, e.g., one from your outlier list:
+problem_id <- "GSDV00229"  # Replace with your outlier ID
+problem_data <- clean_psg_trim %>% filter(Subject_ID == problem_id)
+print(calculate_TST(problem_data))
+
+```
+#REM Onset latency function
+```{r REM onset, echo=FALSE}
+calculate_REM_onset <- function(csv_file) {
+  # Define which events are "sleep"
+  sleep_stages <- c('Stage1', 'Stage2', 'Stage3', 'REM')
+
+  # Sleep onset = first sleep stage (any NREM/REM)
+  sleep_onset_row <- which(csv_file$Event %in% sleep_stages)[1]
+  if (is.na(sleep_onset_row)) return(NA)
+  sleep_onset_time <- csv_file$Start_Time_full[sleep_onset_row]
+
+  # Find first REM event after sleep onset
+  rem_row <- which(csv_file$Event == 'REM' & seq_along(csv_file$Event) > sleep_onset_row)[1]
+  if (is.na(rem_row)) return(NA)
+  rem_time <- csv_file$Start_Time_full[rem_row]
+
+  # REM latency in minutes
+  rem_latency <- as.numeric(difftime(rem_time, sleep_onset_time, units = 'mins'))
+  return(rem_latency)
+}
+rem_lat_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(REM_latency_min = calculate_REM_onset(.x))) %>%
+  ungroup()
+print(rem_lat_table)
+```
+#Sleep onset latency function
+```{r Sleep onset latency, echo=FALSE}
+calculate_sol <- function(csv_file) {
+  # Find first Wake (before sleep onset)
+  wake_time_row <- which(csv_file$Event == 'Wake')[1]
+  if (is.na(wake_time_row)) return(NA)
+  wake_time <- csv_file$Start_Time_full[wake_time_row]
+  
+  # Find first Stage1 (sleep onset)
+  sleep_onset_row <- which(csv_file$Event == 'Stage1')[1]
+  if (is.na(sleep_onset_row)) return(NA)
+  sleep_onset_time <- csv_file$Start_Time_full[sleep_onset_row]
+  
+  # Only calculate if sleep onset is AFTER first wake
+  if (sleep_onset_row <= wake_time_row) return(NA)
+  
+  # Get difference in minutes
+  sol <- as.numeric(difftime(sleep_onset_time, wake_time, units = "mins"))
+  return(sol)
+}
+sol_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(SOL_min = calculate_SOL(.x))) %>%
+  ungroup()
+
+print(sol_table)
+```
+#Time awake function
+```{r time awake, echo=FALSE}
+calculate_time_awake <- function(csv_file) {
+  # Subset the data for 'Wake' events
+  wake_data <- subset(csv_file, Event == 'Wake')
+  
+  # Check if wake_data is empty
+  if (nrow(wake_data) == 0) {
+    return(0)  # Return 0 if no wake events are found
+  }
+  
+  # Sum all wake epoch durations (in seconds)
+  wake_time_seconds <- sum(wake_data$Computed_Duration_sec, na.rm = TRUE)
+  
+  # Convert wake time to minutes
+  wake_time_mins <- wake_time_seconds / 60
+  
+  return(wake_time_mins)
+}
+wake_time_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(time_awake_min = calculate_time_awake(.x))) %>%
+  ungroup()
+
+print(wake_time_table)
+
+
+```
+#n2 time and percent 
+```{r n2}
+calculate_n2_time <- function(csv_file) {
+  n2_data <- subset(csv_file, Event == 'Stage2')
+  
+  # Sum actual epoch durations (in seconds) and convert to minutes
+  n2_time_sec <- sum(n2_data$Computed_Duration_sec, na.rm = TRUE)
+  n2_time_mins <- n2_time_sec / 60
+  
+  return(n2_time_mins)
+}
+
+calculate_n2_percentage <- function(csv_file) {
+  TST <- calculate_TST(csv_file)  # Should already be in minutes
+  n2 <- calculate_n2_time(csv_file)
+  
+  # Return NA if TST is zero (to avoid division by zero)
+  if (TST == 0) return(NA)
+  
+  n2_percentage <- (n2 / TST) * 100
+  return(n2_percentage)
+}
+n2_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(N2_time_min = calculate_n2_time(.x),
+                        N2_percent = calculate_n2_percentage(.x))) %>%
+  ungroup()
+
+print(n2_table)
+
+```
+#N1 time and percent
+```{r N1}
+calculate_n1_time <- function(csv_file) {
+  n1_data <- subset(csv_file, Event == 'Stage1')
+  
+  # Sum actual epoch durations (in seconds) and convert to minutes
+  n1_time_sec <- sum(n1_data$Computed_Duration_sec, na.rm = TRUE)
+  n1_time_mins <- n1_time_sec / 60
+  
+  return(n1_time_mins)
+}
+
+calculate_n1_percentage <- function(csv_file) {
+  TST <- calculate_TST(csv_file)  # Should already be in minutes
+  n1 <- calculate_n1_time(csv_file)
+  
+  if (TST == 0) return(NA)
+  
+  n1_percentage <- (n1 / TST) * 100
+  return(n1_percentage)
+}
+
+n1_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(N1_time_min = calculate_n1_time(.x),
+                        N1_percent = calculate_n1_percentage(.x))) %>%
+  ungroup()
+
+print(n1_table)
+```
+#N3% function
+```{r N3%, echo=FALSE}
+calculate_n3_time <- function(csv_file) {
+  n3_data <- subset(csv_file, Event == 'Stage3')
+  
+  # Sum actual epoch durations (in seconds) and convert to minutes
+  n3_time_sec <- sum(n3_data$Computed_Duration_sec, na.rm = TRUE)
+  n3_time_mins <- n3_time_sec / 60
+  
+  return(n3_time_mins)
+}
+
+calculate_n3_percentage <- function(csv_file) {
+  TST <- calculate_TST(csv_file)  # Should already be in minutes
+  n3 <- calculate_n3_time(csv_file)
+  
+  if (TST == 0) return(NA)
+  
+  n3_percentage <- (n3 / TST) * 100
+  return(n3_percentage)
+}
+
+n3_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(N3_time_min = calculate_n3_time(.x),
+                        N3_percent = calculate_n3_percentage(.x))) %>%
+  ungroup()
+
+print(n3_table)
+
+```
+#REM% function
+```{r REM%, echo=FALSE}
+calculate_rem_time <- function(csv_file) {
+  rem_data <- subset(csv_file, Event == 'REM')
+  
+  # Sum actual epoch durations (in seconds) and convert to minutes
+  rem_time_sec <- sum(rem_data$Computed_Duration_sec, na.rm = TRUE)
+  rem_time_mins <- rem_time_sec / 60
+  
+  return(rem_time_mins)
+}
+
+calculate_rem_percentage <- function(csv_file) {
+  TST <- calculate_TST(csv_file)  # Should already be in minutes
+  rem <- calculate_rem_time(csv_file)
+  
+  if (TST == 0) return(NA)
+  
+  rem_percentage <- (rem / TST) * 100
+  return(rem_percentage)
+}
+
+rem_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(REM_time_min = calculate_rem_time(.x),
+                        REM_percent = calculate_rem_percentage(.x))) %>%
+  ungroup()
+
+print(rem_table)
+
+```
+#TIB function
+```{r tib, echo=FALSE}
+calculate_tib <- function(csv_file){
+  # Use Start_Time_full for accuracy across midnight!
+  
+  # Find first valid Wake (start of TIB)
+  first_wake_row <- which(csv_file$Event == 'Wake')[1]
+  if (is.na(first_wake_row)) return(NA)
+  first_wake_time <- csv_file$Start_Time_full[first_wake_row]
+  
+  # Last epoch is end of TIB
+  last_row <- nrow(csv_file)
+  if (last_row == 0) return(NA)
+  last_time <- csv_file$Start_Time_full[last_row]
+  
+  # TIB = time between first wake and last epoch (in minutes), always positive
+  tib_mins <- as.numeric(difftime(last_time, first_wake_time, units = 'mins'))
+  if (tib_mins < 0) tib_mins <- NA  # Flag for odd files
+  
+  return(tib_mins)
+}
+
+tib_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(TIB_min = calculate_tib(.x))) %>%
+  ungroup()
+
+print(tib_table)
+
+```
+#Sleep efficiency function
+```{r sei, echo=FALSE}
+calculate_sei <- function(csv_file) {
+  # Calculate TST (in minutes)
+  TST <- calculate_TST(csv_file)
+  
+  # Calculate TIB (in minutes)
+  TIB <- calculate_tib(csv_file)
+  
+  # Handle division by zero or NA
+  if (is.na(TST) || is.na(TIB) || TIB == 0) return(NA)
+  
+  # SEI = (TST / TIB) x 100
+  SEI <- (TST / TIB) * 100
+  
+  return(SEI)
+}
+sei_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ tibble(SEI = calculate_sei(.x))) %>%
+  ungroup()
+
+print(sei_table)
+
+# Find and print subjects with suspiciously high SEI
+outlier_sei <- sei_table %>% filter(SEI > 100)
+print(outlier_sei)
+
+
+```
+#% Main loop
+```{r main loop, echo=FALSE}
+# Make sure all these functions are defined:
+# - calculate_TST
+# - calculate_WASO
+# - calculate_sol
+# - calculate_REM_onset
+# - calculate_n1_time
+# - calculate_n1_percentage
+# - calculate_n2_time
+# - calculate_n2_percentage
+# - calculate_n3_time
+# - calculate_n3_percentage
+# - calculate_rem_time
+# - calculate_rem_percentage
+# - calculate_tib
+# - calculate_sei
+
+psg_metrics_for_subject <- function(df) {
+  tibble(
+    TST_min        = calculate_TST(df),
+    WASO_min       = calculate_WASO(df)$waso_min,
+    SOL_min        = calculate_sol(df),
+    REM_Lat_min    = calculate_REM_onset(df),
+    N1_time_min    = calculate_n1_time(df),
+    N1_percent     = calculate_n1_percentage(df),
+    N2_time_min    = calculate_n2_time(df),
+    N2_percent     = calculate_n2_percentage(df),
+    N3_time_min    = calculate_n3_time(df),
+    N3_percent     = calculate_n3_percentage(df),
+    REM_time_min   = calculate_rem_time(df),
+    REM_percent    = calculate_rem_percentage(df),
+    TIB_min        = calculate_tib(df),
+    SEI            = calculate_sei(df)
+  )
+}
+
+psg_results_table <- clean_psg_trim %>%
+  group_by(Subject_ID) %>%
+  group_modify(~ psg_metrics_for_subject(.x)) %>%
+  ungroup()
+
+print(psg_results_table)
+
+
+```
+#Box plots for sleep stages
+```{r Sleep stages plots}
+stage_percents <- psg_results_table %>%
+  select(Subject_ID, N1_percent, N2_percent, N3_percent, REM_percent) %>%
+  pivot_longer(-Subject_ID, names_to = "Stage", values_to = "Percent")
+
+ggplot(stage_percents, aes(x = Stage, y = Percent, fill = Stage)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Sleep Stage Percentages", x = "Sleep Stage", y = "Percent (%)") +
+  theme_minimal()
+
+```
+#Summary stats for PSG results 
+```{r Stats}
+summary_stats <- psg_results_table %>%
+  select(-Subject_ID) %>%
+  summary()
+print(summary_stats)
+```
+#Few histograms if you're looking
+```{r Histograms}
+metrics <- c("TST_min", "WASO_min", "SEI", "SOL_min", "REM_Lat_min")
+
+for (metric in metrics) {
+  print(
+    ggplot(psg_results_table, aes_string(x = metric)) +
+      geom_histogram(bins = 30, fill = "#1f77b4", color = "black", alpha = 0.8) +
+      labs(title = paste("Distribution of", metric), x = metric, y = "Count") +
+      theme_minimal()
+  )
+}
+```
+
