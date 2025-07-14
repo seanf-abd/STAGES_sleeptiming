@@ -1,0 +1,752 @@
+---
+title: "STAGES_plotting"
+author: "Seán F"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r libs, include=FALSE}
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(circular)
+library(purrr)
+library(grid)
+library(xfun)
+library(purrr)
+library(broom)
+library(tidyr)
+library(car)
+library(broom)
+library(lubridate)
+library(stringr)
+library(patchwork)
+library(broom)
+library(readr)
+```
+#load ata
+```{r Data load}
+#Load data from your directory, update this to work without my addresses
+l5 <- read.csv("C:/Users/sefarrell/Downloads/sleep_timing_measures/l5_onset_offset_metrics_10min.csv")
+cpd <- read_csv("C:/Users/sefarrell/Downloads/sleep_timing_measures/composite_phase_deviation_all_subjects.csv")
+sjl <- read_csv("C:/Users/sefarrell/Downloads/sleep_timing_measures/social_jetlag_13window_from_outputs.csv")
+std_dev_midsleep <- read_csv("C:/Users/sefarrell/Downloads/sleep_timing_measures/sleep_circular_stddev_HOURS.csv")
+std_dev_duration <- read_csv("C:/Users/sefarrell/Downloads/sleep_timing_measures/sleep_circular_stddev_HOURS.csv")
+sri <- read_csv("C:/Users/sefarrell/Downloads/sleep_timing_measures/SRI.csv")
+is <- readxl::read_xlsx("C:/Users/sefarrell/Downloads/sleep_timing_measures/IS_summary_all_subjects.xlsx")
+
+#Extract PSG subject IDs
+target_subject_ids <- unique(psg_results_table$Subject_ID)
+
+#Clean and filter data by subject_id
+sri <- sri %>%
+  mutate(subject_id = str_replace(File, "_binary\\.csv$", "")) %>%
+  filter(subject_id %in% target_subject_ids)
+
+is <- is %>%
+  rename(subject_id = Subject_ID) %>%
+  filter(subject_id %in% target_subject_ids)
+
+sjl <- sjl %>% filter(subject_id %in% target_subject_ids)
+std_dev_midsleep <- std_dev_midsleep %>% filter(subject_id %in% target_subject_ids)
+std_dev_duration <- std_dev_duration %>% filter(subject_id %in% target_subject_ids)
+
+if ("File" %in% names(cpd)) {
+  cpd <- cpd %>%
+    mutate(subject_id = str_replace(File, "_window.*$", "")) %>%
+    filter(subject_id %in% target_subject_ids)
+}
+
+#Merge metrics into one df
+cor_df_complete <- reduce(
+  list(
+    cpd %>% select(subject_id, CPD = mean_cpd),
+    sjl %>% select(subject_id, SJL),
+    std_dev_midsleep %>% select(subject_id, SD_Midsleep = midsleep_sd_hours),
+    std_dev_duration %>% select(subject_id, SD_Duration = duration_sd_hours),
+    sri %>% select(subject_id, SRI),
+    is %>% select(subject_id, IS)
+  ),
+  ~left_join(.x, .y, by = "subject_id")
+) %>% na.omit()
+
+#Define analysis_df strictly from those in PSG and cor_df so there's no participants who overlap 
+analysis_df <- psg_results_table %>%
+  rename(subject_id = Subject_ID) %>%
+  inner_join(cor_df_complete, by = "subject_id") %>%
+  distinct(subject_id, .keep_all = TRUE)
+
+#check all the appropriate people are in analysis df
+ids_psg       <- unique(psg_results_table$Subject_ID)
+ids_cor       <- unique(cor_df_complete$subject_id)
+ids_analysis  <- unique(analysis_df$subject_id)
+
+missing_from_cor       <- setdiff(ids_psg, ids_cor)
+missing_from_analysis  <- setdiff(ids_psg, ids_analysis)
+in_cor_not_in_analysis <- setdiff(ids_cor, ids_analysis)
+in_analysis_not_in_cor <- setdiff(ids_analysis, ids_cor)
+
+cat("Subjects in PSG but missing from cor_df_complete:\n")
+print(missing_from_cor)
+
+cat("\nSubjects in PSG but missing from analysis_df:\n")
+print(missing_from_analysis)
+
+cat("\nSubjects in cor_df_complete but missing from analysis_df:\n")
+print(in_cor_not_in_analysis)
+
+cat("\nSubjects in analysis_df but missing from cor_df_complete:\n")
+print(in_analysis_not_in_cor)
+#should be empty all going well
+```
+#Mean times and MEQ 
+```{r Descriptives for table }
+#vals are in decimal format so need to change to appropriate time vals
+decimal_to_hm <- function(hours) {
+  h <- floor(hours)
+  m <- round((hours - h) * 60)
+  if (m == 60) {
+    h <- h + 1
+    m <- 0
+  }
+  h <- h %% 24
+  sprintf("%02d:%02d", h, m)
+}
+v_decimal_to_hm <- Vectorize(decimal_to_hm)
+#use circular mean as before 
+circular_mean_hours <- function(mins_or_hours) {
+  vals_min <- ifelse(mean(mins_or_hours, na.rm = TRUE) < 24, mins_or_hours * 60, mins_or_hours)
+  radians <- circular((vals_min %% 1440) / 1440 * 2 * pi, units = "radians")
+  mean_rad <- mean.circular(radians)
+  mean_hour <- as.numeric(mean_rad) * (1440 / (2 * pi)) %% 1440
+  return(mean_hour / 60)
+}
+#get rid of duplicates
+included_ids <- unique(analysis_df$subject_id)
+
+sleep_timing_cleaned <- sleep_timing %>%
+  filter(subject_id %in% included_ids) %>%
+  mutate(
+    onset_dt  = as.POSIXct(onset, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    offset_dt = as.POSIXct(offset, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    onset_hr  = as.numeric(format(onset_dt, "%H")) +
+                as.numeric(format(onset_dt, "%M")) / 60 +
+                as.numeric(format(onset_dt, "%S")) / 3600,
+    offset_hr = as.numeric(format(offset_dt, "%H")) +
+                as.numeric(format(offset_dt, "%M")) / 60 +
+                as.numeric(format(offset_dt, "%S")) / 3600
+  )
+#set up new df with all timing summaries for group analysis
+timing_summary <- sleep_timing_cleaned %>%
+  summarise(
+    onset_mean_hr     = circular_mean_hours(onset_hr),
+    onset_sd_hr       = sd(onset_hr, na.rm = TRUE),
+    offset_mean_hr    = circular_mean_hours(offset_hr),
+    offset_sd_hr      = sd(offset_hr, na.rm = TRUE),
+    duration_mean_min = mean(duration_mins, na.rm = TRUE),
+    duration_sd_min   = sd(duration_mins, na.rm = TRUE)
+  )
+#get appropriate means
+overall_summary_table <- tibble::tibble(
+  Variable = c("Sleep Onset", "Sleep Offset", "Duration (min)"),
+  Mean     = round(c(timing_summary$onset_mean_hr, timing_summary$offset_mean_hr, timing_summary$duration_mean_min), 2),
+  SD       = round(c(timing_summary$onset_sd_hr, timing_summary$offset_sd_hr, timing_summary$duration_sd_min), 2),
+  N        = c(
+    n_distinct(sleep_timing_cleaned$subject_id[!is.na(sleep_timing_cleaned$onset_hr)]),
+    n_distinct(sleep_timing_cleaned$subject_id[!is.na(sleep_timing_cleaned$offset_hr)]),
+    n_distinct(sleep_timing_cleaned$subject_id[!is.na(sleep_timing_cleaned$duration_mins)])
+  ),
+  `HH:MM`  = c(
+    v_decimal_to_hm(timing_summary$onset_mean_hr),
+    v_decimal_to_hm(timing_summary$offset_mean_hr),
+    sprintf("%02d:%02d",
+            floor(timing_summary$duration_mean_min / 60),
+            round(timing_summary$duration_mean_min %% 60))
+  )
+)
+#scores for meq, used categorical defintions of eveningness/morningness
+meq_tally <- raw_demographics %>%
+  distinct(subject_code, .keep_all = TRUE) %>%
+  filter(subject_code %in% included_ids) %>%
+  mutate(
+    MEQ_category = case_when(
+      cir_0700 < 42 ~ "Evening",
+      cir_0700 >= 42 & cir_0700 <= 58 ~ "Intermediate",
+      cir_0700 > 58 ~ "Morning",
+      TRUE ~ NA_character_
+    ),
+    MEQ_category = factor(MEQ_category, levels = c("Morning", "Intermediate", "Evening"))
+  ) %>%
+  count(MEQ_category, name = "n") %>%
+  filter(!is.na(MEQ_category)) %>%
+  arrange(MEQ_category)
+
+print(overall_summary_table)
+print(meq_tally)
+
+```
+#Sleep regularity measures summary
+```{r Sleep reg descriptives}
+#Summary of sleep regularity metrics for a table
+reg_metrics <- tibble::tibble(
+  Metric = c("SJL", "CPD", "SRI", "IS", "SD_Midsleep"),
+  Mean = c(
+    round(mean(sjl$SJL, na.rm = TRUE), 2),
+    round(mean(cor_df_complete$CPD, na.rm = TRUE), 2),
+    round(mean(cor_df_complete$SRI, na.rm = TRUE), 2),
+    round(mean(cor_df_complete$IS, na.rm = TRUE), 2),
+    round(mean(cor_df_complete$SD_Midsleep, na.rm = TRUE), 2)
+  ),
+  SD = c(
+    round(sd(sjl$SJL, na.rm = TRUE), 2),
+    round(sd(cor_df_complete$CPD, na.rm = TRUE), 2),
+    round(sd(cor_df_complete$SRI, na.rm = TRUE), 2),
+    round(sd(cor_df_complete$IS, na.rm = TRUE), 2),
+    round(sd(cor_df_complete$SD_Midsleep, na.rm = TRUE), 2)
+  ),
+  N = c(
+    sum(!is.na(sjl$SJL)),
+    sum(!is.na(cor_df_complete$CPD)),
+    sum(!is.na(cor_df_complete$SRI)),
+    sum(!is.na(cor_df_complete$IS)),
+    sum(!is.na(cor_df_complete$SD_Midsleep))
+  )
+)
+
+if (requireNamespace("knitr", quietly = TRUE)) {
+  cat("###Sleep Timing by Day Type\n")
+  knitr::kable(
+    diffs_for_report,
+    caption = "Sleep Timing (Clock Time, HH:MM) and Mean Duration (Hours) by Day Type",
+    col.names = c("Variable", "Free Days", "Work Days")
+  )
+  cat("\n###Sleep Regularity Metrics\n")
+  knitr::kable(
+    reg_metrics,
+    caption = "Sleep Regularity Metrics (Mean, SD, N)"
+  )
+}
+```
+#Demographics
+```{r Demograhics}
+# load demographics file from appropriate place in dir
+raw_demographics <- read.csv("C:/Users/sefarrell/Downloads/STAGES_questionnaire/Questionnaires/All_participant_demographics.csv")
+#Remove duplicates from analysis_df by subject_id if needed, just a precaution as they should be already gone
+analysis_df_unique <- analysis_df %>%
+  distinct(subject_id, .keep_all = TRUE)
+included_ids <- unique(analysis_df_unique$subject_id)
+
+#Prepare demographics with missing as NA, do NOT add explicit "Not Reported" factor level, can change depending on what dmeographics are needed
+demographics <- raw_demographics %>%
+  filter(subject_code %in% included_ids) %>%
+  distinct(subject_code, .keep_all = TRUE) %>%  #One row per subject
+  transmute(
+    subject_id = subject_code,
+    sex = na_if(trimws(dem_0500), ""),
+    sex = na_if(sex, " "),
+    age = modified_dem_0110,
+    BMI = dem_0800,
+    race = dem_1000,
+    race = ifelse(race == "", NA, race),
+    smoker = current_cigarette_smoker,
+    exercise = soclhx_0501,
+    gad_score = gad_0800,
+    phq9_score = phq_1000,
+  ) %>%
+  mutate(
+    sex = factor(sex, levels = c("F", "M"), labels = c("Female", "Male")),
+    race = factor(race, levels = 1:6, labels = c(
+      "White/Caucasian",
+      "Black or African American",
+      "American Indian or Alaska Native",
+      "Asian",
+      "Pacific Islander",
+      "Two races or some other race"
+    )),
+    smoker = factor(smoker, levels = c(0, 1), labels = c("No", "Yes")),
+    exercise = factor(exercise, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+#results table
+demographics_table <- tibble(
+  Variable = character(),
+  N = integer(),
+  `% or Mean (SD)` = character()
+)
+
+#exclude missing from N for continous vars
+add_continuous <- function(var, label) {
+  vals <- demographics[[var]]
+  n_non_missing <- sum(!is.na(vals))
+  m <- mean(vals, na.rm = TRUE)
+  s <- sd(vals, na.rm = TRUE)
+  demographics_table <<- add_row(demographics_table,
+    Variable = label,
+    N = n_non_missing,
+    `% or Mean (SD)` = sprintf("%.2f (%.2f)", m, s)
+  )
+}
+
+#each outcome on separate row for categorical for readability
+add_categorical <- function(var, label) {
+  vals <- demographics[[var]]
+  vals <- vals[!is.na(vals)]  # exclude NA from counts
+  tab <- table(vals)
+  n <- sum(tab)
+  
+  #Add category headers
+  demographics_table <<- add_row(demographics_table,
+    Variable = label,
+    N = n,
+    `% or Mean (SD)` = ""
+  )
+  
+  #each outcome as a separate row
+  for (outcome in names(tab)) {
+    count <- tab[outcome]
+    percent <- sprintf("%.1f%%", 100 * count / n)
+    demographics_table <<- add_row(demographics_table,
+      Variable = paste0("  ", outcome),  # Indent subcategories
+      N = as.integer(count),  # Show individual count in N column
+      `% or Mean (SD)` = paste0("(", percent, ")")  # Just percentage in parentheses
+    )
+  }
+}
+
+#Add sample size row at the top
+sample_size <- length(included_ids)
+sample_size_row <- tibble(
+  Variable = "Sample size",
+  N = sample_size,
+  `% or Mean (SD)` = ""
+)
+demographics_table <- bind_rows(sample_size_row, demographics_table)
+
+#Build  table
+add_continuous("age", "Age (years)")
+add_categorical("sex", "Sex")
+add_continuous("BMI", "BMI")
+add_categorical("race", "Race")
+add_categorical("smoker", "Current Smoker")
+add_categorical("exercise", "Exercise Frequently")
+add_continuous("gad_score", "GAD-7 Score")
+add_continuous("phq9_score", "PHQ-9 Score")
+
+#print with proper line breaks
+print_demographics_table <- function(tbl) {
+  bold_vars <- c(
+    "Sample size", "Age (years)", "Sex", "BMI", "Race",
+    "Current Smoker", "Exercise Frequency", "GAD-7 Score", "PHQ-9 Score"
+  )
+  
+  for (i in seq_len(nrow(tbl))) {
+    is_bold <- tbl$Variable[i] %in% bold_vars
+    heading <- if (is_bold) paste0("\033[1m", tbl$Variable[i], "\033[0m") else tbl$Variable[i]
+    
+    cat(heading, "\n")
+    cat("N:", tbl$N[i], "\n")
+    cat(tbl$`% or Mean (SD)`[i], "\n\n")
+  }
+}
+
+print_demographics_table(demographics_table)
+
+#Save demographics_table, can render as .PDF later if needed
+save(demographics_table, file = "C:/Users/sefarrell/Downloads/demographics_table.RData")
+```
+#Account for no. of people from each site
+```{r Study site}
+#Load data and extract locality (it's the subject ID prefix)
+analysis_df_names <- analysis_df %>%
+  mutate(site_code = substr(subject_id, 1, 4))
+
+#Map site codes to locations
+site_lookup <- tibble::tibble(
+  site_code = c("BOGN", "GSBB", "GSDV", "GSLH", "GSSA", "GSSW", "MSNF", "MAYO", "MSQW", "MSTR", "STLK", "STNF", "MSMI", "MSTH"),
+  location = c("South Carolina", "Pennsylvania", "Pennsylvania", "Pennsylvania", "Pennsylvania", "Pennsylvania",
+               "Niagara Falls", "Minnesota", "Toronto", "Ontario", "Missouri", "California", "Ontario", "Toronto")
+)
+
+#Join and count
+location_summary <- analysis_df_names %>%
+  distinct(subject_id, .keep_all = TRUE) %>%
+  left_join(site_lookup, by = "site_code") %>%
+  count(location, name = "n_subjects") %>%
+  mutate(
+    percent = round(n_subjects / sum(n_subjects) * 100, 1),
+    formatted = paste0(location, "\t", n_subjects, " (", percent, "%)")
+  )
+
+print(location_summary %>% select(location, formatted))
+```
+#Graph for distribution of SJL 
+```{r SJL graph}
+#plot Sjl acorss all inlcuded participants
+ggplot(sjl, aes(x = SJL)) +
+  geom_histogram(binwidth = 0.2, fill = "#0073C2FF", color = "white", alpha = 0.8, boundary = 0) +
+  labs(
+    title = "Distribution of Social Jetlag (SJL)",
+    x = "SJL (hours)",
+    y = "Number of Participants"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+#Save as a  PNG
+ggsave("C:/Users/sefarrell/Downloads/sjl_spread.png", width = 7, height = 4, dpi = 300)
+```
+#Plot via locality 
+```{r Location}
+#Just seperates SJL by locality 
+sjl <- sjl %>% mutate(locality = substr(subject_id, 1, 4))
+sleep_timing <- sleep_timing %>% mutate(locality = substr(subject_id, 1, 4))
+
+ggplot(sjl, aes(x = locality, y = SJL, color = locality)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.18) +
+  geom_jitter(width = 0.35, size = 2, alpha = 0.7) +
+  labs(
+    title = "Social Jetlag (SJL) by Locality",
+    x = "Locality",
+    y = "SJL (hours)"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 16),
+     plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+ggsave("C:/Users/sefarrell/Downloads/sjl_by_locality_spread.png", width = 13, height = 5.5, dpi = 300)
+```
+#Plot concordance table 
+```{r Concordance}
+#summarize concordance between all sleep timing measures in analysis subset
+included_ids <- unique(analysis_df$subject_id)
+filtered_df <- cor_df_complete %>%
+  filter(subject_id %in% included_ids)
+metric_names <- c("SRI", "SD_Midsleep", "IS", "CPD", "SJL")
+
+#Get all unique metric pairs (no repeats), should be okay but better safe than sorry
+metric_pairs <- combn(metric_names, 2, simplify = FALSE)
+
+#compute r and p for each pair of metrics
+get_corr_stats <- function(pair, df) {
+  x <- pair[1]
+  y <- pair[2]
+  test <- cor.test(df[[x]], df[[y]], method = "pearson")
+  tibble(
+    Comparison = paste(x, "vs.", y),
+    r = round(test$estimate, 2),
+    p_value = ifelse(test$p.value < 0.001, "<0.001", sprintf("%.3f", test$p.value))
+  )
+}
+
+#Apply to all pairs and bind into table
+cor_summary_table <- map_dfr(metric_pairs, get_corr_stats, df = filtered_df)
+
+print(cor_summary_table)
+write.csv(cor_summary_table,"C:/Users/sefarrell/Downloads/sleepregtable_final.csv")
+
+```
+#Sciencey graphs for concordance between metrics
+```{r More plots}
+#SRI vs. SD Midsleep
+cor_A <- cor(cor_df_complete$SD_Midsleep, cor_df_complete$SRI, method = "pearson")
+
+pA <- ggplot(cor_df_complete, aes(x = SD_Midsleep, y = SRI)) +
+  geom_point(alpha = 0.5, size = 2, color = "#286090") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+  annotate(
+    "text", 
+    x = max(cor_df_complete$SD_Midsleep, na.rm = TRUE) - 0.1,
+    y = max(cor_df_complete$SRI, na.rm = TRUE) - 2,
+    label = sprintf("r = %.2f", cor_A),
+    hjust = 1, vjust = 1, size = 6, fontface = "plain", color = "black"
+  ) +
+  labs(
+    title = "Sleep Regularity Index vs. Midsleep Standard Deviation",
+    x = "Midsleep Standard Deviation (hours)",
+    y = "Sleep Regularity Index"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(plot.title = element_text(face = "plain", hjust = 0))
+
+#SRI vs. IS
+cor_B <- cor(cor_df_complete$SRI, cor_df_complete$IS, method = "pearson")
+
+pB <- ggplot(cor_df_complete, aes(x = SRI, y = IS)) +
+  geom_point(alpha = 0.5, size = 2, color = "#286090") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+  annotate(
+    "text", 
+    x = max(cor_df_complete$SRI, na.rm = TRUE) - 1,
+    y = max(cor_df_complete$IS, na.rm = TRUE) - 0.01,
+    label = sprintf("r = %.2f", cor_B),
+    hjust = 1, vjust = 1, size = 6, fontface = "plain", color = "black"
+  ) +
+  labs(
+    title = "Sleep Regularity Index vs. Interdaily Stability",
+    x = "Sleep Regularity Index",
+    y = "Interdaily Stability"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(plot.title = element_text(face = "plain", hjust = 0))
+
+#Plot SJL by itself to visualize distribution 
+median_sjl <- median(sjl$SJL, na.rm = TRUE)
+pC <- ggplot(sjl, aes(x = SJL)) +
+  geom_density(fill = "lightblue", color = "blue", alpha = 0.3) +
+  geom_vline(xintercept = median_sjl, linetype = "dashed", color = "black", size = 1) +
+  labs(
+    title = "Distribution of Social Jetlag (SJL)",
+    x = "Social Jetlag (hours)",
+    y = "Density"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(plot.title = element_text(face = "plain", hjust = 0))
+
+combined <- (pA / pB / pC) + 
+  patchwork::plot_annotation(
+    tag_levels = 'A', 
+    tag_prefix = "", 
+    tag_suffix = "."
+  )
+
+ggsave(
+  "C:/Users/sefarrell/Downloads/sleep_metrics_panel.png",
+  combined, width = 8, height = 15, dpi = 300, bg = "white"
+)
+
+```
+#tab;es 
+```{r tables}
+#Select relevant columns
+metrics <- cor_df_complete %>%
+  dplyr::select(SJL, CPD, SRI, IS, SD_Midsleep)
+
+#Summarise descriptives in long format for table
+desc_df <- tibble(
+  Metric = c("SJL", "CPD", "SRI", "IS", "SD_Midsleep"),
+  Mean = c(
+    mean(metrics$SJL, na.rm=TRUE),
+    mean(metrics$CPD, na.rm=TRUE),
+    mean(metrics$SRI, na.rm=TRUE),
+    mean(metrics$IS, na.rm=TRUE),
+    mean(metrics$SD_Midsleep, na.rm=TRUE)
+  ),
+  SD = c(
+    sd(metrics$SJL, na.rm=TRUE),
+    sd(metrics$CPD, na.rm=TRUE),
+    sd(metrics$SRI, na.rm=TRUE),
+    sd(metrics$IS, na.rm=TRUE),
+    sd(metrics$SD_Midsleep, na.rm=TRUE)
+  ),
+  N = nrow(metrics)
+)
+
+desc_df %>%
+  gt() %>%
+  fmt_number(
+    columns = c(Mean, SD),
+    decimals = 2
+  ) %>%
+  tab_header(
+    title = md("**Sleep Regularity Metrics**")
+  ) %>%
+  cols_label(
+    Metric = md("**Metric**"),
+    Mean = md("**Mean**"),
+    SD = md("**SD**"),
+    N = md("**N**")
+  ) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.width = pct(60),
+    table.border.top.color = "teal",
+    table.border.top.width = px(4),
+    heading.background.color = "teal",
+    column_labels.background.color = "teal",
+    column_labels.font.weight = "bold",
+    table_body.border.bottom.color = "black"
+  )
+
+```
+#% models across 3 sleep stages with 3 levels of covariates
+```{r % Models}
+#Add BMI to demographics
+demographics <- read.csv("C:/Users/sefarrell/Downloads/STAGES_questionnaire/Questionnaires/All_participant_demographics.csv") %>%
+  dplyr::select(
+    subject_id = subject_code,
+    age         = modified_dem_0110,
+    sex         = dem_0500,
+    BMI         = dem_0800,
+    gad_score   = gad_0800,
+    phq9_score  = phq_1000
+  ) %>%
+  mutate(sex = factor(sex, levels = c("F", "M")))
+
+#Select sleep timing metrics
+timing_vars <- cor_df_complete %>%
+  dplyr::select(subject_id, SD_Duration, SJL, SRI, IS)
+
+#Select PSG percent and latency variables
+psg_vars <- psg_results_table %>%
+  rename(subject_id = Subject_ID) %>%
+  dplyr::select(subject_id, N2_percent, N3_percent, REM_percent, REM_Lat_min, SOL)
+
+#Merge datasets
+analysis_df <- timing_vars %>%
+  inner_join(psg_vars, by = "subject_id") %>%
+  inner_join(demographics, by = "subject_id") %>%
+  filter(complete.cases(.))
+#=== Define model sets ===
+dvs <- c("SRI", "SD_Duration", "SJL", "IS")
+
+raw_predictors  <- "N2_percent + N3_percent + REM_percent + REM_Lat_min + SOL"
+demo_predictors <- paste(raw_predictors, "+ age + sex + BMI")
+full_predictors <- paste(demo_predictors, "+ phq9_score + gad_score")
+
+model_list <- list(
+  "Raw PSG only"     = raw_predictors,
+  "Add demographics" = demo_predictors,
+  "Add PHQ9 & GAD7"  = full_predictors
+)
+
+#Fit models and store results
+model_results <- list()
+vif_results   <- list()
+
+for (dv in dvs) {
+  for (label in names(model_list)) {
+    fmla <- as.formula(paste(dv, "~", model_list[[label]]))
+    model <- lm(fmla, data = analysis_df)
+
+    #Coefficients
+    tidy_df <- tidy(model, conf.int = TRUE) %>%
+      mutate(outcome = dv, model_type = label) %>%
+      select(outcome, model_type, term, estimate, conf.low, conf.high, p.value)
+
+    #VIFs
+    vif_df <- vif(model)
+    vif_df <- tibble(
+      outcome = dv,
+      model_type = label,
+      term = names(vif_df),
+      VIF = as.numeric(vif_df)
+    )
+
+    model_results[[paste(dv, label)]] <- tidy_df
+    vif_results[[paste(dv, label)]]   <- vif_df
+  }
+}
+
+all_model_results <- bind_rows(model_results)
+all_vif_results   <- bind_rows(vif_results)
+cat("\n=== Model Estimates ===\n")
+print(all_model_results)
+cat("\n=== VIF Results ===\n")
+print(all_vif_results)
+```
+#Secondary data analysis, load data 
+```{r Second level}
+cpd_path <- "C:/Users/sefarrell/Downloads/sleep_timing_measures/composite_phase_deviation_all_subjects.csv"
+std_path <- "C:/Users/sefarrell/Downloads/sleep_timing_measures/sleep_circular_stddev_HOURS.csv"
+#Read the CPD file
+cpd <- read_csv(cpd_path)
+print("CPD file:")
+print(str(cpd))
+#Read the onset/offset/midsleep SD file
+std_dev_timing <- read_csv(std_path)
+print("STD DEV file:")
+print(str(std_dev_timing))
+cpd_clean <- cpd %>%
+  select(subject_id, mean_cpd)
+
+std_clean <- std_dev_timing %>%
+  select(subject_id, onset_sd_hours, offset_sd_hours, midsleep_sd_hours)
+secondary_complete_df <- inner_join(cpd_clean, std_clean, by = "subject_id")
+print(secondary_complete_df)
+```
+#Secondary models 3 stages, 3 levels 
+```{r 2ndairy}
+#reload demogrpahcis, just out this here in case only second one needs to be run/vice versa
+demographics <- read.csv("C:/Users/sefarrell/Downloads/STAGES_questionnaire/Questionnaires/All_participant_demographics.csv") %>%
+  dplyr::select(
+    subject_id = subject_code,
+    age         = modified_dem_0110,
+    sex         = dem_0500,
+    BMI         = dem_0800,
+    gad_score   = gad_0800,
+    phq9_score  = phq_1000
+  ) %>%
+  mutate(sex = factor(sex, levels = c("F", "M")))
+
+#Select PSG architecture variables
+psg_vars <- psg_results_table %>%
+  rename(subject_id = Subject_ID) %>%
+  dplyr::select(subject_id, N2_percent, N3_percent, REM_percent, REM_Lat_min, SOL)
+
+#Select DVs from secondary_complete_df
+secondary_dvs <- secondary_complete_df %>%
+  dplyr::select(subject_id, onset_sd_hours, offset_sd_hours, midsleep_sd_hours, mean_cpd)
+
+#Merge data
+analysis_df_secondary <- secondary_dvs %>%
+  inner_join(psg_vars, by = "subject_id") %>%
+  inner_join(demographics, by = "subject_id") %>%
+  filter(complete.cases(.))
+
+#Define outcomes and model formulas
+dvs_secondary <- c("onset_sd_hours", "offset_sd_hours", "midsleep_sd_hours", "mean_cpd")
+
+model_list_secondary <- list(
+  "Raw PSG only"     = "N2_percent + N3_percent + REM_percent + REM_Lat_min + SOL",
+  "Add demographics" = "N2_percent + N3_percent + REM_percent + REM_Lat_min + SOL + age + sex + BMI",
+  "Add PHQ9 & GAD7"  = "N2_percent + N3_percent + REM_percent + REM_Lat_min + SOL + age + sex + BMI + phq9_score + gad_score"
+)
+
+#Run models and store results
+model_results_secondary <- list()
+vif_results_secondary   <- list()
+
+for (dv in dvs_secondary) {
+  for (label in names(model_list_secondary)) {
+    fmla <- as.formula(paste(dv, "~", model_list_secondary[[label]]))
+    model <- lm(fmla, data = analysis_df_secondary)
+
+    tidy_df <- broom::tidy(model, conf.int = TRUE) %>%
+      mutate(outcome = dv, model_type = label) %>%
+      select(outcome, model_type, term, estimate, conf.low, conf.high, p.value)
+
+    vif_df <- car::vif(model)
+    vif_df <- tibble(
+      outcome = dv,
+      model_type = label,
+      term = names(vif_df),
+      VIF = as.numeric(vif_df)
+    )
+
+    model_results_secondary[[paste(dv, label)]] <- tidy_df
+    vif_results_secondary[[paste(dv, label)]]   <- vif_df
+  }
+}
+
+all_model_results_secondary <- bind_rows(model_results_secondary)
+all_vif_results_secondary   <- bind_rows(vif_results_secondary)
+
+save(
+  all_model_results,
+  all_model_results_secondary,
+  model_list,
+  model_list_secondary,
+  analysis_df,
+  analysis_df_secondary,
+  file = "C:/Users/sefarrell/Downloads/analysis_objects.RData"
+)
+
+```
