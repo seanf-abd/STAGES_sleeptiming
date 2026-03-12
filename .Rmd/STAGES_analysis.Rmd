@@ -1,0 +1,803 @@
+---
+title: "STAGES_plotting"
+author: "Seán F"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r libs, include=FALSE}
+suppressPackageStartupMessages({
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(circular)
+library(corrplot)
+library(lmtest) 
+library(purrr)
+library(grid)
+library(xfun)
+library(purrr)
+library(effectsize)
+library(broom)
+library(tidyr)
+library(ggeffects)
+library(car)
+library(broom)
+library(lubridate)
+library(stringr)
+library(patchwork)
+library(broom)
+library(readr)
+})
+```
+#load ata
+```{r Data load}
+#This code assumes that the other two .Rmd's have been ran first, without this you will not be able to access most of the files needed in the resultant chunks
+#this is the demographics file available from the NSRR site entitled stages-dataset-0.3.0.csv
+raw_demographics <- read.csv("your_file_path_here")
+#All below files are from the Actigraphy_workflow.Rmd
+#This is the participants lowest 12 hours of activity file 
+l5 <- read.csv("your_file_path_here")
+#This is each participatns CPD score file
+cpd <- readr::read_csv("your_file_path_here")
+#This is each participatns SJL  file
+sjl <- readr::read_csv("your_file_path_here")
+#These are all same location, just need to load the vals separately
+std_dev_midsleep <- readr::read_csv("your_file_path_here")
+std_dev_duration <- readr::read_csv("your_file_path_here")
+std_dev_onset <- read.csv("your_file_path_here")
+std_dev_offset <- read.csv("your_file_path_here") 
+#SRI score
+sri <- readr::read_csv("your_file_path_here")
+#IS score
+is <- readr::read_csv("your_file_path_here")
+#need this for the mean calculations to be completed in the demographics section
+sleep_timing <- read.csv("your_file_path_here")
+target_subject_ids <- unique(psg_results_table$Subject_ID)
+#Clean and filter data by subject_id, some columns have different headings so jut standardize
+sri <- sri %>%
+  dplyr::mutate(Subject_ID = stringr::str_replace(File, "_binary\\.csv$", "")) %>%
+  dplyr::rename(subject_id = Subject_ID) %>%
+  dplyr::filter(subject_id %in% target_subject_ids)
+is <- is %>%
+  dplyr::rename(subject_id = Subject_ID) %>%
+  dplyr::filter(subject_id %in% target_subject_ids)
+#Be sure values are taken from appropraite subjects
+sjl <- sjl %>% dplyr::filter(subject_id %in% target_subject_ids)
+std_dev_midsleep <- std_dev_midsleep %>% dplyr::filter(subject_id %in% target_subject_ids)
+std_dev_onset <- std_dev_onset %>% dplyr::filter(subject_id %in% target_subject_ids)
+std_dev_offset <- std_dev_offset %>% dplyr::filter(subject_id %in% target_subject_ids)
+std_dev_duration <- std_dev_duration %>% dplyr::filter(subject_id %in% target_subject_ids)
+cpd <- cpd %>% dplyr::filter(subject_id %in% target_subject_ids)
+#Clean metric datasets, just removes fluff
+cpd <- tibble::as_tibble(cpd) %>% dplyr::select(subject_id, CPD = mean_cpd)
+sjl <- tibble::as_tibble(sjl) %>% dplyr::select(subject_id, SJL)
+std_dev_midsleep <- tibble::as_tibble(std_dev_midsleep) %>% dplyr::select(subject_id, SD_Midsleep = midsleep_sd_hours)
+std_dev_duration <- tibble::as_tibble(std_dev_duration) %>% dplyr::select(subject_id, SD_Duration = duration_sd_hours)
+std_dev_onset <- tibble::as_tibble(std_dev_onset) %>% dplyr::select(subject_id, SD_Onset = onset_sd_hours)
+std_dev_offset <- tibble::as_tibble(std_dev_offset) %>% dplyr::select(subject_id, SD_Offset = offset_sd_hours)
+sri <- tibble::as_tibble(sri) %>% dplyr::select(subject_id, SRI)
+is <- tibble::as_tibble(is) %>% dplyr::select(subject_id, IS)
+#Safe join helper (prevents .x/.y)
+safe_left_join <- function(x, y, by) {
+  dup <- intersect(names(x), names(y))
+  dup <- setdiff(dup, by)
+  if (length(dup) > 0) {
+    x <- dplyr::select(x, -dplyr::any_of(dup))
+  }
+  dplyr::left_join(x, y, by = by)
+}
+#Merge all metrics
+cor_df_complete <- purrr::reduce(
+  list(cpd, sjl, std_dev_midsleep, std_dev_duration, sri, is, std_dev_onset, std_dev_offset),
+  ~safe_left_join(.x, .y, by = "subject_id")
+) %>%
+  dplyr::distinct(subject_id, .keep_all = TRUE)
+
+#Define demo variables of interest, more/less can be added for covariates later 
+demo_vars <- c("age", "sex", "gad_score", "phq9_score", "rmeq_score")
+#Build analysis_df
+analysis_df <- psg_results_table %>%
+  dplyr::rename(subject_id = Subject_ID) %>%
+  dplyr::select(-dplyr::any_of(demo_vars)) %>%
+  dplyr::inner_join(cor_df_complete, by = "subject_id") %>%
+  dplyr::distinct(subject_id, .keep_all = TRUE) %>%
+  dplyr::left_join(
+    raw_demographics %>% 
+      dplyr::transmute(
+        subject_id  = subject_code,
+        age         = modified_dem_0110,
+        sex         = factor(dem_0500, levels = c("F", "M")),
+        gad_score   = gad_0800,
+        phq9_score  = phq_1000,
+        rmeq_score  = cir_0700
+      ),
+    by = "subject_id"
+  ) %>%
+  dplyr::filter(age >= 18) #can remove/change if needed 
+#Can't use 4 psg stages due to multicollinearity
+baseline_vars <- c(
+  "SRI","SJL","IS",
+  "N2_percent","N3_percent","REM_percent","REM_Lat_min","SOL"
+)
+
+analysis_df <- analysis_df %>%
+  dplyr::filter(stats::complete.cases(dplyr::select(., dplyr::all_of(baseline_vars)))) %>%
+  dplyr::distinct(subject_id, .keep_all = TRUE)
+
+#Final IDs used everywhere downstream
+included_ids <- unique(analysis_df$subject_id)
+#check ===
+cat("Baseline N:", nrow(analysis_df), "\n")
+cat("Distinct subjects:", dplyr::n_distinct(analysis_df$subject_id), "\n") # just in case there are some duplicates
+```
+#Mean times and MEQ 
+```{r Descriptives for table}
+#need to compute circular measn for time vals
+circular_mean_hours <- function(mins_or_hours) {
+  vals_min <- ifelse(mean(mins_or_hours, na.rm = TRUE) < 24, mins_or_hours * 60, mins_or_hours)
+  radians <- circular((vals_min %% 1440) / 1440 * 2 * pi, units = "radians")
+  mean_rad <- mean.circular(radians)
+  mean_hour <- as.numeric(mean_rad) * (1440 / (2 * pi)) %% 1440
+  return(mean_hour / 60)
+}
+included_ids <- unique(analysis_df$subject_id)
+sleep_timing_cleaned <- sleep_timing %>%
+  dplyr::filter(subject_id %in% included_ids) %>%
+  dplyr::mutate(
+    onset_dt  = as.POSIXct(onset, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    offset_dt = as.POSIXct(offset, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    onset_hr  = as.numeric(format(onset_dt, "%H")) +
+                as.numeric(format(onset_dt, "%M")) / 60 +
+                as.numeric(format(onset_dt, "%S")) / 3600,
+    offset_hr = as.numeric(format(offset_dt, "%H")) +
+                as.numeric(format(offset_dt, "%M")) / 60 +
+                as.numeric(format(offset_dt, "%S")) / 3600
+  )
+
+#Per-subject means FIRST
+per_subject_means <- sleep_timing_cleaned %>%
+  dplyr::group_by(subject_id) %>%
+  dplyr::summarise(
+    mean_onset_hr   = circular_mean_hours(onset_hr),
+    mean_offset_hr  = circular_mean_hours(offset_hr),
+    mean_TST        = mean(TST_mins, na.rm = TRUE),
+    mean_SPT        = mean(SPT_mins, na.rm = TRUE),
+    mean_WASO       = mean(WASO_mins, na.rm = TRUE),
+    mean_SEI_pct    = mean(SEI_pct, na.rm = TRUE),   #<-- ADDED
+    .groups = "drop"
+  )
+
+#Group-level means
+timing_summary <- per_subject_means %>%
+  dplyr::summarise(
+    onset_mean_hr     = mean(mean_onset_hr, na.rm = TRUE),
+    onset_sd_hr       = sd(mean_onset_hr, na.rm = TRUE),
+    offset_mean_hr    = mean(mean_offset_hr, na.rm = TRUE),
+    offset_sd_hr      = sd(mean_offset_hr, na.rm = TRUE),
+    SPT_mean_min      = mean(mean_SPT, na.rm = TRUE),
+    SPT_sd_min        = sd(mean_SPT, na.rm = TRUE),
+    TST_mean_min      = mean(mean_TST, na.rm = TRUE),
+    TST_sd_min        = sd(mean_TST, na.rm = TRUE),
+    WASO_mean_min     = mean(mean_WASO, na.rm = TRUE),
+    WASO_sd_min       = sd(mean_WASO, na.rm = TRUE),
+    SEI_mean_pct      = mean(mean_SEI_pct, na.rm = TRUE), 
+    SEI_sd_pct        = sd(mean_SEI_pct, na.rm = TRUE)     
+  )
+overall_summary_table <- tibble::tibble(
+  Variable = c(
+    "Sleep Onset",
+    "Sleep Offset",
+    "Sleep Period Time (min)",
+    "Total Sleep Time (min)",
+    "WASO (min)",
+    "Sleep Efficiency (%)"
+  ),
+  Mean     = round(c(
+    timing_summary$onset_mean_hr,
+    timing_summary$offset_mean_hr,
+    timing_summary$SPT_mean_min,
+    timing_summary$TST_mean_min,
+    timing_summary$WASO_mean_min,
+    timing_summary$SEI_mean_pct
+  ), 2),
+  SD       = round(c(
+    timing_summary$onset_sd_hr,
+    timing_summary$offset_sd_hr,
+    timing_summary$SPT_sd_min,
+    timing_summary$TST_sd_min,
+    timing_summary$WASO_sd_min,
+    timing_summary$SEI_sd_pct
+  ), 2),
+  N        = rep(nrow(per_subject_means), 6),
+  `Mean (HH:MM)` = c(
+    v_decimal_to_hm(timing_summary$onset_mean_hr),
+    v_decimal_to_hm(timing_summary$offset_mean_hr),
+    sprintf("%02d:%02d", floor(timing_summary$SPT_mean_min / 60), round(timing_summary$SPT_mean_min %% 60)),
+    sprintf("%02d:%02d", floor(timing_summary$TST_mean_min / 60), round(timing_summary$TST_mean_min %% 60)),
+    sprintf("%02d:%02d", floor(timing_summary$WASO_mean_min / 60), round(timing_summary$WASO_mean_min %% 60)))
+)
+#MEQ categories taken from NSRR website
+meq_by_subject <- raw_demographics %>%
+  dplyr::distinct(subject_code, .keep_all = TRUE) %>%
+  dplyr::filter(subject_code %in% included_ids) %>%
+  dplyr::mutate(
+    MEQ_category = dplyr::case_when(
+      cir_0700 >= 4  & cir_0700 <= 7  ~ "Definitely Evening Type",
+      cir_0700 >= 8  & cir_0700 <= 11 ~ "Moderately Evening Type",
+      cir_0700 >= 12 & cir_0700 <= 17 ~ "Neither Type",
+      cir_0700 >= 18 & cir_0700 <= 21 ~ "Moderately Morning Type",
+      cir_0700 >= 22 & cir_0700 <= 25 ~ "Definitely Morning Type",
+      TRUE ~ NA_character_
+    ),
+    MEQ_category = factor(
+      MEQ_category,
+      levels = c(
+        "Definitely Evening Type",
+        "Moderately Evening Type",
+        "Neither Type",
+        "Moderately Morning Type",
+        "Definitely Morning Type"
+      )
+    )
+  ) %>%
+  dplyr::select(subject_id = subject_code, MEQ_score = cir_0700, MEQ_category) %>%
+  dplyr::arrange(MEQ_category, subject_id)
+
+meq_tally <- meq_by_subject %>%
+  dplyr::count(MEQ_category, name = "n") %>%
+  dplyr::arrange(MEQ_category)
+
+print(overall_summary_table)
+print(meq_tally)
+#Save eveything to .csv if easier
+write.csv(overall_summary_table, "your_path_here", row.names = FALSE)
+write.csv(meq_tally, "your_path_here", row.names = FALSE)
+```
+#Demographics
+```{r Demograhics}
+#LOad demographics file and tally 
+raw_demographics <- read.csv("path_same_as_earlier_demographics_file")
+demographics <- raw_demographics %>%
+  filter(subject_code %in% included_ids) %>%
+  distinct(subject_code, .keep_all = TRUE) %>%  #One row per subject
+  transmute(
+    subject_id = subject_code,
+    sex = na_if(trimws(dem_0500), ""),
+    sex = na_if(sex, " "),
+    age = modified_dem_0110,
+    BMI = dem_0800,
+    race = dem_1000,
+    race = ifelse(race == "", NA, race),
+    smoker = current_cigarette_smoker,
+    exercise = soclhx_0501,
+    gad_score = gad_0800,
+    phq9_score = phq_1000,
+  ) %>%
+  mutate(
+    sex = factor(sex, levels = c("F", "M"), labels = c("Female", "Male")),
+    race = factor(race, levels = 1:6, labels = c(
+      "White/Caucasian",
+      "Black or African American",
+      "American Indian or Alaska Native",
+      "Asian",
+      "Pacific Islander",
+      "Two races or some other race"
+    )),
+    smoker = factor(smoker, levels = c(0, 1), labels = c("No", "Yes")),
+    exercise = factor(exercise, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+#Initialize results table
+demographics_table <- tibble(
+  Variable = character(),
+  N = integer(),
+  `% or Mean (SD)` = character()
+)
+#Helper for continuous vars: exclude missing from N
+add_continuous <- function(var, label) {
+  vals <- demographics[[var]]
+  n_non_missing <- sum(!is.na(vals))
+  m <- mean(vals, na.rm = TRUE)
+  s <- sd(vals, na.rm = TRUE)
+  demographics_table <<- add_row(demographics_table,
+    Variable = label,
+    N = n_non_missing,
+    `% or Mean (SD)` = sprintf("%.2f (%.2f)", m, s)
+  )
+}
+add_categorical <- function(var, label) {
+  vals <- demographics[[var]]
+  vals <- vals[!is.na(vals)]  #exclude NA from counts
+  tab <- table(vals)
+  n <- sum(tab)
+  
+  #Add main category header
+  demographics_table <<- add_row(demographics_table,
+    Variable = label,
+    N = n,
+    `% or Mean (SD)` = ""
+  )
+  
+  #Add each outcome as a separate row
+  for (outcome in names(tab)) {
+    count <- tab[outcome]
+    percent <- sprintf("%.1f%%", 100 * count / n)
+    demographics_table <<- add_row(demographics_table,
+      Variable = paste0("  ", outcome),  #Indent subcategories
+      N = as.integer(count),  #Show individual count in N column
+      `% or Mean (SD)` = paste0("(", percent, ")")  #Just percentage in parentheses
+    )
+  }
+}
+#Add sample size at the top just to see how many responses are in each section as it's likely to vary
+sample_size <- length(included_ids)
+sample_size_row <- tibble(
+  Variable = "Sample size",
+  N = sample_size,
+  `% or Mean (SD)` = ""
+)
+demographics_table <- bind_rows(sample_size_row, demographics_table)
+#Build the table
+add_continuous("age", "Age (years)")
+add_categorical("sex", "Sex")
+add_continuous("BMI", "BMI")
+add_categorical("race", "Race")
+add_categorical("smoker", "Current Smoker")
+add_categorical("exercise", "Exercise Frequently")
+add_continuous("gad_score", "GAD-7 Score")
+add_continuous("phq9_score", "PHQ-9 Score")
+print_demographics_table <- function(tbl) {
+  bold_vars <- c(
+    "Sample size", "Age (years)", "Sex", "BMI", "Race",
+    "Current Smoker", "Exercise Frequency", "GAD-7 Score", "PHQ-9 Score"
+  )
+  for (i in seq_len(nrow(tbl))) {
+    is_bold <- tbl$Variable[i] %in% bold_vars
+    heading <- if (is_bold) paste0("\033[1m", tbl$Variable[i], "\033[0m") else tbl$Variable[i]
+    cat(heading, "\n")
+    cat("N:", tbl$N[i], "\n")
+    cat(tbl$`% or Mean (SD)`[i], "\n\n")
+  }
+}
+print_demographics_table(demographics_table)
+write.csv(demographics_table,"your_path_here")
+```
+#Mean STV scores
+```{r STV means}
+#These were for a separate table designed to delineate sleep-related characteristics of population
+sleep_timing_vars <- c(
+   "SRI",
+  "SJL",
+  "IS",
+  "CPD",
+  "SD_Midsleep",
+  "SD_Onset",
+  "SD_Offset",
+  "SD_Duration"
+)
+sleep_timing_descriptives <- analysis_df %>%
+  dplyr::select(dplyr::all_of(sleep_timing_vars)) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  dplyr::group_by(Measure) %>%
+  dplyr::summarise(
+    n    = sum(!is.na(Value)),
+    mean = mean(Value, na.rm = TRUE),
+    sd   = sd(Value, na.rm = TRUE),
+    range = paste0(
+      round(min(Value, na.rm = TRUE), 2),
+      "–",
+      round(max(Value, na.rm = TRUE), 2)
+    ),
+    .groups = "drop"
+  )
+
+write.csv(
+  sleep_timing_descriptives,
+  "your_path_here",
+  row.names = FALSE
+)
+```
+
+#Mean PSG scores
+```{r PSG scores}
+#same as prev chunk,not mandatory to run but may be beneficial to see characterisitcs of analysis sample
+PSG_vals <- c(
+   "TST_min", 
+   "SEI", 
+   "WASO_min",
+   "N1_percent", 
+   "N2_percent",
+   "N3_percent",
+   "REM_percent",
+   "REM_Lat_min"
+)
+
+PSG_descriptives <- analysis_df %>%
+  dplyr::select(dplyr::all_of(PSG_vals)) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "Measure",
+    values_to = "Value"
+  ) %>%
+  dplyr::group_by(Measure) %>%
+  dplyr::summarise(
+    n    = sum(!is.na(Value)),
+    mean = mean(Value, na.rm = TRUE),
+    sd   = sd(Value, na.rm = TRUE),
+    range = paste0(
+      round(min(Value, na.rm = TRUE), 2),
+      "–",
+      round(max(Value, na.rm = TRUE), 2)
+    ),
+    .groups = "drop"
+  )
+
+write.csv(
+  PSG_descriptives,
+  "your_path_heere",
+  row.names = FALSE
+)
+```
+#Account for no. of people from each site
+```{r Study site}
+#Load actigraphy data and extract locality prefix
+analysis_df_names <- analysis_df %>%
+  mutate(site_code = substr(subject_id, 1, 4))
+#Map site codes to locations
+site_lookup <- tibble::tibble(
+  site_code = c("BOGN", "GSBB", "GSDV", "GSLH", "GSSA", "GSSW", "MSNF", "MAYO", "MSQW", "MSTR", "STLK", "STNF", "MSMI", "MSTH"),
+  location = c("South Carolina", "Pennsylvania", "Pennsylvania", "Pennsylvania", "Pennsylvania", "Pennsylvania",
+               "Niagara Falls", "Minnesota", "Toronto", "Ontario", "Missouri", "California", "Ontario", "Toronto")
+)
+#Join and count
+location_summary <- analysis_df_names %>%
+  distinct(subject_id, .keep_all = TRUE) %>%
+  left_join(site_lookup, by = "site_code") %>%
+  count(location, name = "n_subjects") %>%
+  mutate(
+    percent = round(n_subjects / sum(n_subjects) * 100, 1),
+    formatted = paste0(location, "\t", n_subjects, " (", percent, "%)")
+  )
+
+print(location_summary %>% select(location, formatted))
+write.csv(location_summary, "your_path_here")
+```
+#Correlation coefficient of all stvs
+```{r Correlations}
+sleep_metrics_df <- analysis_df %>%
+  dplyr::select(dplyr::all_of(sleep_timing_vars)) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric))
+
+corr_table <- combn(sleep_timing_vars, 2, simplify = FALSE) %>%
+  purrr::map_dfr(function(v) {
+    v1 <- v[1]
+    v2 <- v[2]
+    tmp <- sleep_metrics_df %>%
+      dplyr::select(dplyr::all_of(c(v1, v2))) %>%
+      tidyr::drop_na()
+    ct <- suppressWarnings(
+      stats::cor.test(
+        tmp[[v1]], tmp[[v2]],
+        method = "spearman", exact = FALSE
+      )
+    )
+    tibble::tibble(
+      Comparison = paste(v1, "vs", v2),
+      r = round(unname(ct$estimate), 2),
+      p_raw = ct$p.value  # keep raw numeric for correction
+    )
+  }) %>%
+  #Benjamin Hochberg method to correct for multiple comparisons
+  dplyr::mutate(
+    p_adj = p.adjust(p_raw, method = "BH"),
+    `p-value` = ifelse(p_raw < 0.001, "<0.001", formatC(p_raw, format = "f", digits = 3)),
+    `p-value (BH)` = ifelse(p_adj < 0.001, "<0.001", formatC(p_adj, format = "f", digits = 3))
+  ) %>%
+  dplyr::select(Comparison, r, `p-value (BH)`)
+
+write.csv(
+  corr_table,
+  "your_file_path",
+  row.names = FALSE
+)
+```
+#correlation plots
+```{r corr plots primary stv's}
+primary_metrics <- c("SJL", "SRI", "IS") # can change these depending on what associations you are looking to examine
+sleep_metrics_df <- analysis_df %>%
+  dplyr::select(dplyr::all_of(primary_metrics)) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric)) %>%
+  tidyr::drop_na()
+#Function to create individual scatter plot with Spearman correlation
+create_scatter_plot <- function(data, x_var, y_var, panel_label, plot_title) {
+  #Calculate Spearman correlation on accoutn of non-normality of data
+  cor_test <- cor.test(data[[x_var]], data[[y_var]],
+                       method = "spearman", exact = FALSE)
+  r_val <- round(cor_test$estimate, 2)
+  p_val <- cor_test$p.value
+  #Format r-value with significance stars
+  if (p_val < 0.001) {
+    r_text <- paste0("r=", sprintf("%.2f", r_val), "***")
+  } else if (p_val < 0.01) {
+    r_text <- paste0("r=", sprintf("%.2f", r_val), "**")
+  } else if (p_val < 0.05) {
+    r_text <- paste0("r=", sprintf("%.2f", r_val), "*")
+  } else {
+    r_text <- paste0("r=", sprintf("%.2f", r_val))
+  }
+  #Full variable names
+  x_label <- switch(x_var,
+                    "SJL" = "Social Jetlag (hours)",
+                    "SRI" = "Sleep Regularity Index",
+                    "IS"  = "Interdaily Stability")
+
+  y_label <- switch(y_var,
+                    "SJL" = "Social Jetlag (hours)",
+                    "SRI" = "Sleep Regularity Index",
+                    "IS"  = "Interdaily Stability")
+  base_size <- 16     
+  title_size <- 18
+  axis_title_size <- 18
+  axis_text_size <- 17
+  panel_label_size <- 20
+  r_text_size <- 16
+  p <- ggplot(data, aes(x = .data[[x_var]], y = .data[[y_var]])) +
+    geom_point(alpha = 0.7, size = 2.6, color = "black") +
+    geom_smooth(method = "lm", se = FALSE, color = "blue", linewidth = 1.2) +
+    labs(
+      x = x_label,
+      y = y_label,
+      title = plot_title
+    ) +
+    annotate("text", x = Inf, y = Inf,
+             label = r_text,
+             hjust = 1.05, vjust = 1.2, size = r_text_size/ggplot2::.pt,
+             fontface = "bold") +
+    annotate("text", x = -Inf, y = Inf,
+             label = panel_label,
+             hjust = -0.3, vjust = 1.2, size = panel_label_size/ggplot2::.pt,
+             fontface = "bold") +
+    theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_text(size = title_size, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = axis_title_size),
+      axis.text  = element_text(size = axis_text_size),
+      plot.margin = margin(10, 14, 10, 10)
+    )
+
+  return(p)
+}
+
+#Create the three plots with titles
+p1 <- create_scatter_plot(sleep_metrics_df, "SJL", "SRI", "A",
+                          "Social Jetlag vs Sleep Regularity Index")
+p2 <- create_scatter_plot(sleep_metrics_df, "SJL", "IS", "B",
+                          "Social Jetlag vs Interdaily Stability")
+p3 <- create_scatter_plot(sleep_metrics_df, "SRI", "IS", "C",
+                          "Sleep Regularity Index vs Interdaily Stability")
+
+#Combine plots
+combined_plot <- patchwork::wrap_plots(p1, p2, p3, ncol = 3)
+
+#Display
+print(combined_plot)
+
+#Save (bigger height helps readability a lot for 3 panels)
+ggsave(
+  "your_file_path",
+  plot = combined_plot,
+  width = 18,
+  height = 7,
+  dpi = 300
+)
+```
+#%Models' for all DV's
+```{r Primary models }
+dvs <- c("SRI","SJL","IS") #Can reorient these depending on what associations you are looking to investigate
+raw_predictors  <- "N2_percent + N3_percent + REM_percent + REM_Lat_min + SOL"
+demo_predictors <- paste(raw_predictors, "+ age + sex")
+full_predictors <- paste(demo_predictors, "+ phq9_score + gad_score + rmeq_score")
+
+model_list <- list(
+  "Raw PSG only"           = raw_predictors,
+  "Add demographics"       = demo_predictors,
+  "Add PHQ9, GAD7 & rMEQ"  = full_predictors
+)
+
+#Fit models and store results
+model_results <- list()
+vif_results   <- list()
+
+for (dv in dvs) {
+  for (label in names(model_list)) {
+
+    fmla  <- as.formula(paste(dv, "~", model_list[[label]]))
+    model <- lm(fmla, data = analysis_df)
+    n_used <- nobs(model)
+
+#Model-level fit stats
+    fit_df <- broom::glance(model) %>%
+      dplyr::transmute(
+        outcome    = dv,
+        model_type = label,
+        n_obs      = n_used,
+        R2         = r.squared,
+        adj_R2     = adj.r.squared
+      )
+
+#Standardized betas (post-hoc; no CI)
+    std_df <- effectsize::standardize_parameters(model) %>%
+      dplyr::rename(term = Parameter) %>%
+      dplyr::transmute(
+        term,
+        Std_Beta = Std_Coefficient
+      )
+
+    #Raw coefficients + CI
+    tidy_df <- broom::tidy(model, conf.int = TRUE) %>%
+      dplyr::left_join(std_df, by = "term") %>%
+      dplyr::mutate(outcome = dv, model_type = label, n_obs = n_used) %>%
+      dplyr::left_join(fit_df, by = c("outcome", "model_type", "n_obs")) %>%
+      dplyr::select(
+        outcome, model_type, n_obs, R2, adj_R2,
+        term,
+        Std_Beta,            #β
+        estimate,            #B
+        std.error,           #SE
+        conf.low, conf.high, #95% CI (B)
+        statistic, p.value
+      )
+
+#VIFs
+    predictor_terms <- attr(terms(model), "term.labels")
+    vif_raw <- tryCatch(
+      car::vif(model),
+      error = function(e) setNames(rep(NA_real_, length(predictor_terms)), predictor_terms)
+    )
+
+    vif_df <- tibble::tibble(
+      outcome    = dv,
+      model_type = label,
+      term       = predictor_terms,
+      VIF        = as.numeric(vif_raw[predictor_terms]),
+      n_obs      = n_used
+    )
+
+    model_results[[paste(dv, label, sep = "_")]] <- tidy_df
+    vif_results[[paste(dv, label, sep = "_")]]   <- vif_df
+  }
+}
+
+#Combine outputs
+all_model_results <- dplyr::bind_rows(model_results)
+all_vif_results   <- dplyr::bind_rows(vif_results)
+
+#View
+cat("\nModel Estimates\n")
+print(all_model_results)
+
+cat("\nVIF Results\n")
+print(all_vif_results)
+
+#Save
+write.csv(
+  all_model_results,
+"your_path_here", row.names = FALSE
+)
+
+write.csv(
+  all_vif_results,
+  "your_path_here",
+  row.names = FALSE
+)
+```
+#% Secondary model 
+```{r Secondary model}
+dvs <- c("SD_Midsleep","SD_Duration","SD_Onset", "SD_Offset","CPD") #these are just the remaining DV's
+raw_predictors  <- "N2_percent + N3_percent + REM_percent + REM_Lat_min + SOL"
+demo_predictors <- paste(raw_predictors, "+ age + sex")
+full_predictors <- paste(demo_predictors, "+ phq9_score + gad_score + rmeq_score")
+#Exact same covariates as prev model
+model_list <- list(
+  "Raw PSG only"           = raw_predictors,
+  "Add demographics"       = demo_predictors,
+  "Add PHQ9, GAD7 & rMEQ"  = full_predictors
+)
+model_results <- list()
+vif_results   <- list()
+
+for (dv in dvs) {
+  for (label in names(model_list)) {
+
+    fmla  <- as.formula(paste(dv, "~", model_list[[label]]))
+    model <- lm(fmla, data = analysis_df)
+    n_used <- nobs(model)
+
+#Model-level fit stats
+    fit_df <- broom::glance(model) %>%
+      dplyr::transmute(
+        outcome    = dv,
+        model_type = label,
+        n_obs      = n_used,
+        R2         = r.squared,
+        adj_R2     = adj.r.squared
+      )
+
+#Standardized betas (post-hoc; no CI)
+    std_df <- effectsize::standardize_parameters(model) %>%
+      dplyr::rename(term = Parameter) %>%
+      dplyr::transmute(
+        term,
+        Std_Beta = Std_Coefficient
+      )
+
+#Raw coefficients + CI (B scale)
+    tidy_df <- broom::tidy(model, conf.int = TRUE) %>%
+      dplyr::left_join(std_df, by = "term") %>%
+      dplyr::mutate(outcome = dv, model_type = label, n_obs = n_used) %>%
+      dplyr::left_join(fit_df, by = c("outcome", "model_type", "n_obs")) %>%
+      dplyr::select(
+        outcome, model_type, n_obs, R2, adj_R2,
+        term,
+        Std_Beta,            #β
+        estimate,            #B
+        std.error,           #SE
+        conf.low, conf.high, #95% CI (B)
+        statistic, p.value
+      )
+
+#VIFs
+    predictor_terms <- attr(terms(model), "term.labels")
+    vif_raw <- tryCatch(
+      car::vif(model),
+      error = function(e) setNames(rep(NA_real_, length(predictor_terms)), predictor_terms)
+    )
+
+    vif_df <- tibble::tibble(
+      outcome    = dv,
+      model_type = label,
+      term       = predictor_terms,
+      VIF        = as.numeric(vif_raw[predictor_terms]),
+      n_obs      = n_used
+    )
+
+    model_results[[paste(dv, label, sep = "_")]] <- tidy_df
+    vif_results[[paste(dv, label, sep = "_")]]   <- vif_df
+  }
+}
+
+#Combine outputs
+all_model_results <- dplyr::bind_rows(model_results)
+all_vif_results   <- dplyr::bind_rows(vif_results)
+
+#View
+cat("\n Model Estimates\n")
+print(all_model_results)
+
+cat("\nVIF Results\n")
+print(all_vif_results)
+
+#Save
+write.csv(
+  all_model_results,
+  "your_path_here",
+  row.names = FALSE
+)
+
+write.csv(
+  all_vif_results,
+  "your_path_here",
+  row.names = FALSE
+)
+vars_needed <- c("SRI", "N2_percent", "N3_percent", "REM_percent", "REM_Lat_min", "SOL",
+                 "age", "sex", "phq9_score", "gad_score", "rmeq_score")
+sum(stats::complete.cases(analysis_df[, vars_needed]))
+```
+
