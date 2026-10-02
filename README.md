@@ -3,9 +3,7 @@
 
 ## General Information on Dataset utilised
 ### Summary/Abstract
-> A short and contextualized description of the data, containing a brief overview of the the dataset purpose, methods and (if applicable) results.  
-> The comprehensives details are to be recorded in sections below. This section should help others to understand the content of the dataset without its thorough examination.
-> This section can replace the "Description" section if information overlaps. 
+> The goal of this is to provide clear resources to access data used in this manuscript, should a researcher want to obtain access. Similarly, this document provides a brief overview of analysis scripts, as well as instructions for utilising them appropriately. 
   ### Title of Dataset         
     Stanford Technology Analytics and Genomics in Sleep (STAGES) dataset
 
