@@ -29,7 +29,7 @@ This is a secondary data source, freely-obtained from https://sleepdata.org/data
 The STAGES dataset is available for non-commercial and commercial use. Permission is hereby granted, free of charge, to any person obtaining a copy of this analysis code   and associated documentation files (the "analysis code"), to deal in the the analysis without restriction, including without limitation the rights to use,               copy,modify,merge, publish, distribute, sublicense, and/or sell copies of the analysis code, and to permit persons to whom the analysis code is furnished to do so, subject to the following conditions. All I ask is that if you use some of the analysis code for your own research, please cite the original paper. 
 
 ## Analysis Code
--### Summary/Abstract
+### Summary/Abstract
 > More information on the dataset is available athttps://sleepdata.org/datasets/stages/pages/README.md
 >The aim of this section is to provide an overview of the analysis code utilised in the manuscript
 
