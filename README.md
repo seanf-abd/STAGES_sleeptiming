@@ -2,7 +2,7 @@
 >This document has been structured to mirror templates published in Zieliński, T., Hodge, J. J. L., & Millar, A. J. (2023). Keep It Simple: Using README Files to Advance Standardization in Chronobiology. Clocks & Sleep, 5(3), 499-506. https://doi.org/10.3390/clockssleep5030033
 
 ## General Information on Dataset utilised
--### Summary/Abstract
+### Summary/Abstract
 > A short and contextualized description of the data, containing a brief overview of the the dataset purpose, methods and (if applicable) results.  
 > The comprehensives details are to be recorded in sections below. This section should help others to understand the content of the dataset without its thorough examination.
 > This section can replace the "Description" section if information overlaps. 
